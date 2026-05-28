@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16
+    container_name: discord_hotmap_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: discord_hotmap
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d discord_hotmap"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discord_hotmap_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pg_data:
