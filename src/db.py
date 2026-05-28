@@ -89,12 +89,63 @@ class Database:
           AND author_id = $2
           AND created_at >= $3
         GROUP BY channel_name
-        ORDER BY cnt DESC
-        LIMIT 20;
+        ORDER BY cnt DESC;
         """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(query, guild_id, author_id, from_time)
             return [(str(r["channel_name"]), int(r["cnt"])) for r in rows]
+
+    async def get_hotmap_total_messages(
+        self,
+        guild_id: int,
+        author_id: int,
+        from_time: datetime,
+    ) -> int:
+        assert self.pool is not None
+        query = """
+        SELECT COUNT(*)::BIGINT
+        FROM messages
+        WHERE guild_id = $1
+          AND author_id = $2
+          AND created_at >= $3;
+        """
+        async with self.pool.acquire() as conn:
+            value = await conn.fetchval(query, guild_id, author_id, from_time)
+            return int(value or 0)
+
+    async def get_hotmap_total_messages_all_guilds(
+        self,
+        author_id: int,
+        from_time: datetime,
+    ) -> int:
+        assert self.pool is not None
+        query = """
+        SELECT COUNT(*)::BIGINT
+        FROM messages
+        WHERE author_id = $1
+          AND created_at >= $2;
+        """
+        async with self.pool.acquire() as conn:
+            value = await conn.fetchval(query, author_id, from_time)
+            return int(value or 0)
+
+    async def get_hotmap_guild_breakdown(
+        self,
+        author_id: int,
+        from_time: datetime,
+    ) -> List[Tuple[int, int]]:
+        assert self.pool is not None
+        query = """
+        SELECT guild_id, COUNT(*)::BIGINT AS cnt
+        FROM messages
+        WHERE author_id = $1
+          AND created_at >= $2
+        GROUP BY guild_id
+        ORDER BY cnt DESC;
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, author_id, from_time)
+            return [(int(r["guild_id"]), int(r["cnt"])) for r in rows]
 
     async def get_kv(self, key: str) -> str | None:
         assert self.pool is not None
