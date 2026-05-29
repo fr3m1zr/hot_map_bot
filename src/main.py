@@ -15,7 +15,8 @@ from .config import Settings
 from .db import Database
 
 
-MIN_HOTMAP_MESSAGES = 5
+LOW_ACTIVITY_RATIO_THRESHOLD = 0.005
+OTHER_CATEGORY_LABEL = "其他"
 MAX_CHART_CHANNELS = 12
 
 
@@ -27,8 +28,27 @@ def format_count(n: int) -> str:
     return str(n)
 
 
-def filter_hotmap_rows(rows: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
-    return [(name, cnt) for name, cnt in rows if cnt > MIN_HOTMAP_MESSAGES]
+def aggregate_hotmap_rows(rows: List[Tuple[str, int]]) -> Tuple[List[Tuple[str, int]], int]:
+    total = sum(cnt for _, cnt in rows)
+    if total <= 0:
+        return [], 0
+
+    grouped_rows: List[Tuple[str, int]] = []
+    other_total = 0
+    low_active_channel_count = 0
+
+    for channel_name, cnt in rows:
+        share = cnt / total
+        if share < LOW_ACTIVITY_RATIO_THRESHOLD:
+            other_total += cnt
+            low_active_channel_count += 1
+            continue
+        grouped_rows.append((channel_name, cnt))
+
+    if other_total > 0:
+        grouped_rows.append((OTHER_CATEGORY_LABEL, other_total))
+
+    return grouped_rows, low_active_channel_count
 
 
 def clean_channel_label_for_chart(channel_name: str) -> str:
@@ -104,10 +124,13 @@ def fit_text(
     return fitted.rstrip() + ellipsis
 
 
-def describe_activity_shape(rows: List[Tuple[str, int]]) -> Tuple[str, str, float, float]:
+def describe_activity_shape(
+    rows: List[Tuple[str, int]],
+    low_active_channel_count: int,
+) -> Tuple[str, str, float, float]:
     total = sum(cnt for _, cnt in rows)
     if total == 0:
-        return "沒有資料", "此區間沒有超過門檻的頻道", 0, 0
+        return "沒有資料", "此區間沒有可用資料", 0, 0
 
     top_share = rows[0][1] / total
     top_three_share = sum(cnt for _, cnt in rows[:3]) / total
@@ -115,13 +138,17 @@ def describe_activity_shape(rows: List[Tuple[str, int]]) -> Tuple[str, str, floa
 
     if top_share >= 0.60 or top_three_share >= 0.85:
         label = "集中型"
-        detail = f"主要集中在 {top_channel}"
+        detail = f"集中出沒在 {top_channel}"
     elif top_share <= 0.35 and top_three_share <= 0.65 and len(rows) >= 4:
         label = "分散型"
-        detail = "多個頻道都有穩定出沒"
+        detail = "活躍分散在多個頻道"
     else:
         label = "中度集中"
-        detail = f"偏向 {top_channel}，但仍有其他活躍頻道"
+        detail = f"主要出沒在 {top_channel}，也常在其他頻道互動"
+
+    if low_active_channel_count > 0:
+        detail = f"{detail}，另有 {low_active_channel_count} 個較低活躍的頻道"
+
     return label, detail, top_share, top_three_share
 
 
@@ -130,8 +157,15 @@ def render_hotmap_chart(
     days: int,
     all_rows: List[Tuple[str, int]],
     visible_rows: List[Tuple[str, int]],
+    low_active_channel_count: int,
 ) -> BytesIO:
     rows = visible_rows[:MAX_CHART_CHANNELS]
+    if (
+        len(visible_rows) > MAX_CHART_CHANNELS
+        and visible_rows[-1][0] == OTHER_CATEGORY_LABEL
+        and rows[-1][0] != OTHER_CATEGORY_LABEL
+    ):
+        rows = visible_rows[: MAX_CHART_CHANNELS - 1] + [visible_rows[-1]]
     width = 1200
     row_height = 74
     top_padding = 430
@@ -171,8 +205,11 @@ def render_hotmap_chart(
     total_all = sum(cnt for _, cnt in all_rows)
     total_visible = sum(cnt for _, cnt in visible_rows)
     max_count = max((cnt for _, cnt in rows), default=0)
-    shape_source = visible_rows if visible_rows else all_rows
-    shape_label, shape_detail, top_share, top_three_share = describe_activity_shape(shape_source)
+    shape_source = all_rows
+    shape_label, shape_detail, top_share, top_three_share = describe_activity_shape(
+        shape_source,
+        low_active_channel_count,
+    )
     top_channel = clean_channel_label_for_chart(shape_source[0][0]) if shape_source else "-"
     verdict_color = "#b42318" if shape_label == "集中型" else "#027a48"
     if shape_label == "中度集中":
@@ -198,7 +235,7 @@ def render_hotmap_chart(
 
     stat_blocks = [
         (650, "總留言", format_count(total_all)),
-        (820, "出沒頻道", str(len(visible_rows))),
+        (820, "出沒頻道", str(len(all_rows))),
         (990, "前三占比", f"{top_three_share:.0%}"),
     ]
     for x, label, value in stat_blocks:
@@ -206,9 +243,6 @@ def render_hotmap_chart(
         draw.text((x, 228), label, fill=muted, font=stat_label_font)
 
     detail = shape_detail
-    if visible_rows and total_all > total_visible:
-        hidden = total_all - total_visible
-        detail = f"{shape_detail}（另有 {format_count(hidden)} 則分布在低活躍頻道）"
     draw.text((52, 328), fit_text(draw, detail, subtitle_font, 1080), fill=muted, font=subtitle_font)
 
     meter_x = 52
@@ -664,13 +698,14 @@ def build_hotmap_command(bot: HotmapBot) -> app_commands.Command:
         )
 
         target_label = format_user_label(interaction, user)
-        visible_rows = filter_hotmap_rows(rows)
+        visible_rows, low_active_channel_count = aggregate_hotmap_rows(rows)
         total_messages = sum(cnt for _, cnt in rows)
         visible_messages = sum(cnt for _, cnt in visible_rows)
         print(
             "[Hotmap] "
             f"guild={guild_id}, author={user.id}, days={days_value}, "
             f"all_channels={len(rows)}, visible_channels={len(visible_rows)}, "
+            f"low_active_channels={low_active_channel_count}, "
             f"all_messages={total_messages}, visible_messages={visible_messages}, "
             f"guild_total_messages={guild_total_messages}, "
             f"all_guilds_total_messages={all_guilds_total_messages}, "
@@ -678,7 +713,13 @@ def build_hotmap_command(bot: HotmapBot) -> app_commands.Command:
         )
         print(f"[HotmapTop10] {rows[:10]}")
         result = render_hotmap_text(target_label, days_value, visible_rows)
-        chart = render_hotmap_chart(target_label, days_value, rows, visible_rows)
+        chart = render_hotmap_chart(
+            target_label,
+            days_value,
+            rows,
+            visible_rows,
+            low_active_channel_count,
+        )
         file = discord.File(chart, filename="hotmap.png")
         await interaction.followup.send(f"```text\n{result}\n```", file=file)
 
