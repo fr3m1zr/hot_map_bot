@@ -1,10 +1,11 @@
 from datetime import datetime, timedelta, timezone
 import asyncio
+import json
 from io import BytesIO
 import re
 import traceback
 import unicodedata
-from typing import List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 import discord
 from discord import app_commands
@@ -18,6 +19,7 @@ from .db import Database
 LOW_ACTIVITY_RATIO_THRESHOLD = 0.005
 OTHER_CATEGORY_LABEL = "其他"
 MAX_CHART_CHANNELS = 12
+CUSTOM_EMOJI_REGEX = re.compile(r"<a?:([A-Za-z0-9_]+):(\d+)>")
 
 
 def format_count(n: int) -> str:
@@ -26,6 +28,18 @@ def format_count(n: int) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.1f}k"
     return str(n)
+
+
+def to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def truncate_text(text: str, limit: int = 1000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
 
 
 def aggregate_hotmap_rows(rows: List[Tuple[str, int]]) -> Tuple[List[Tuple[str, int]], int]:
@@ -323,6 +337,7 @@ class HotmapBot(discord.Client):
         intents = discord.Intents.default()
         intents.guilds = True
         intents.messages = True
+        intents.message_content = True
         super().__init__(intents=intents)
         self.settings = settings
         self.db = db
@@ -362,6 +377,7 @@ class HotmapBot(discord.Client):
         if message.author.bot:
             return
 
+        snapshot = self._build_message_snapshot(message)
         channel_name = getattr(message.channel, "name", f"channel-{message.channel.id}")
         inserted = await self.db.insert_message(
             message_id=message.id,
@@ -370,13 +386,204 @@ class HotmapBot(discord.Client):
             channel_name=channel_name,
             author_id=message.author.id,
             created_at=message.created_at,
+            content=snapshot["content"],
+            author_display_name=snapshot["author_display_name"],
+            author_avatar_url=snapshot["author_avatar_url"],
+            attachments_json=json.dumps(snapshot["attachments"], ensure_ascii=False),
+            stickers_json=json.dumps(snapshot["stickers"], ensure_ascii=False),
+            custom_emojis_json=json.dumps(snapshot["custom_emojis"], ensure_ascii=False),
         )
         if inserted:
             self.total_ingested_messages += 1
             self.window_ingested_messages += 1
 
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        if payload.guild_id is None:
+            return
+
+        delete_log_channel_id = await self.db.get_delete_log_channel(payload.guild_id)
+        if delete_log_channel_id is None:
+            print(
+                "[DeleteLog] Raw delete received but no log channel configured "
+                f"guild={payload.guild_id}, channel={payload.channel_id}, message_id={payload.message_id}"
+            )
+            return
+
+        print(
+            "[DeleteLog] Raw delete received "
+            f"guild={payload.guild_id}, channel={payload.channel_id}, "
+            f"message_id={payload.message_id}, cached={payload.cached_message is not None}"
+        )
+
+        snapshot: Dict[str, Any] | None = None
+        if payload.cached_message is not None and not payload.cached_message.author.bot:
+            snapshot = self._build_message_snapshot(payload.cached_message)
+            snapshot["message_id"] = payload.cached_message.id
+            snapshot["guild_id"] = payload.cached_message.guild.id if payload.cached_message.guild else payload.guild_id
+            snapshot["channel_id"] = payload.cached_message.channel.id
+            snapshot["channel_name"] = getattr(payload.cached_message.channel, "name", f"channel-{payload.cached_message.channel.id}")
+            snapshot["author_id"] = payload.cached_message.author.id
+            snapshot["created_at"] = payload.cached_message.created_at
+        else:
+            db_row = await self.db.get_message_snapshot(payload.message_id)
+            if db_row is not None:
+                snapshot = self._build_snapshot_from_db_row(db_row)
+
+        await self._send_deleted_message_log(
+            guild_id=payload.guild_id,
+            delete_log_channel_id=delete_log_channel_id,
+            message_id=payload.message_id,
+            fallback_channel_id=payload.channel_id,
+            snapshot=snapshot,
+        )
+
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
+        if payload.guild_id is None:
+            return
+
+        delete_log_channel_id = await self.db.get_delete_log_channel(payload.guild_id)
+        if delete_log_channel_id is None:
+            print(
+                "[DeleteLog] Raw bulk delete received but no log channel configured "
+                f"guild={payload.guild_id}, channel={payload.channel_id}, count={len(payload.message_ids)}"
+            )
+            return
+
+        message_ids = [int(mid) for mid in payload.message_ids]
+        print(
+            "[DeleteLog] Raw bulk delete received "
+            f"guild={payload.guild_id}, channel={payload.channel_id}, count={len(message_ids)}"
+        )
+
+        snapshot_by_id: Dict[int, Dict[str, Any]] = {}
+        cached_messages = getattr(payload, "cached_messages", [])
+        for message in cached_messages:
+            if message.author.bot:
+                continue
+            snapshot = self._build_message_snapshot(message)
+            snapshot["message_id"] = message.id
+            snapshot["guild_id"] = message.guild.id if message.guild else payload.guild_id
+            snapshot["channel_id"] = message.channel.id
+            snapshot["channel_name"] = getattr(message.channel, "name", f"channel-{message.channel.id}")
+            snapshot["author_id"] = message.author.id
+            snapshot["created_at"] = message.created_at
+            snapshot_by_id[message.id] = snapshot
+
+        uncached_ids = [mid for mid in message_ids if mid not in snapshot_by_id]
+        if uncached_ids:
+            db_rows = await self.db.get_message_snapshots(uncached_ids)
+            for mid, row in db_rows.items():
+                snapshot_by_id[mid] = self._build_snapshot_from_db_row(row)
+
+        for message_id in message_ids:
+            await self._send_deleted_message_log(
+                guild_id=payload.guild_id,
+                delete_log_channel_id=delete_log_channel_id,
+                message_id=message_id,
+                fallback_channel_id=payload.channel_id,
+                snapshot=snapshot_by_id.get(message_id),
+            )
+
     async def on_thread_create(self, thread: discord.Thread) -> None:
         await self._try_join_thread(thread, reason="new-thread")
+
+    def _build_message_snapshot(self, message: discord.Message) -> Dict[str, Any]:
+        content = message.content or ""
+        attachments = []
+        for attachment in message.attachments:
+            attachments.append(
+                {
+                    "filename": attachment.filename,
+                    "url": attachment.url,
+                    "content_type": attachment.content_type or "",
+                    "size": attachment.size,
+                }
+            )
+
+        stickers = []
+        for sticker in message.stickers:
+            format_name = ""
+            format_value = getattr(sticker, "format", None)
+            if format_value is not None:
+                format_name = to_text(getattr(format_value, "name", format_value)).lower()
+
+            sticker_url = to_text(getattr(sticker, "url", ""))
+            if not sticker_url:
+                sticker_url = self._build_sticker_asset_url(sticker.id, format_name)
+
+            stickers.append(
+                {
+                    "id": sticker.id,
+                    "name": sticker.name,
+                    "format": format_name,
+                    "url": sticker_url,
+                }
+            )
+
+        custom_emojis = []
+        for match in CUSTOM_EMOJI_REGEX.finditer(content):
+            emoji_name = match.group(1)
+            emoji_id = match.group(2)
+            custom_emojis.append(
+                {
+                    "name": emoji_name,
+                    "id": emoji_id,
+                    "animated": match.group(0).startswith("<a:"),
+                }
+            )
+
+        if isinstance(message.author, discord.Member):
+            author_display_name = message.author.display_name
+        else:
+            author_display_name = message.author.global_name or message.author.name
+
+        avatar_url = ""
+        if message.author.display_avatar is not None:
+            avatar_url = str(message.author.display_avatar.url)
+
+        return {
+            "content": content,
+            "author_display_name": author_display_name,
+            "author_avatar_url": avatar_url,
+            "attachments": attachments,
+            "stickers": stickers,
+            "custom_emojis": custom_emojis,
+        }
+
+    def _build_sticker_asset_url(self, sticker_id: int, format_name: str) -> str:
+        if sticker_id <= 0:
+            return ""
+        ext = "png"
+        if format_name in {"gif"}:
+            ext = "gif"
+        elif format_name in {"lottie"}:
+            ext = "json"
+        return f"https://media.discordapp.net/stickers/{sticker_id}.{ext}"
+
+    def _build_snapshot_from_db_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        def parse_json_list(raw: Any) -> List[Any]:
+            if raw is None:
+                return []
+            try:
+                parsed = json.loads(str(raw))
+                return parsed if isinstance(parsed, list) else []
+            except json.JSONDecodeError:
+                return []
+
+        return {
+            "message_id": int(row.get("id", 0)),
+            "guild_id": int(row.get("guild_id", 0)),
+            "channel_id": int(row.get("channel_id", 0)),
+            "channel_name": to_text(row.get("channel_name")) or "unknown-channel",
+            "author_id": int(row.get("author_id", 0)),
+            "created_at": row.get("created_at"),
+            "content": to_text(row.get("content")),
+            "author_display_name": to_text(row.get("author_display_name")),
+            "author_avatar_url": to_text(row.get("author_avatar_url")),
+            "attachments": parse_json_list(row.get("attachments_json")),
+            "stickers": parse_json_list(row.get("stickers_json")),
+            "custom_emojis": parse_json_list(row.get("custom_emojis_json")),
+        }
 
     async def close(self) -> None:
         if self.metrics_task is not None:
@@ -398,6 +605,203 @@ class HotmapBot(discord.Client):
                 "[IngestMetrics] "
                 f"window={interval}s, new_messages={window_count}, "
                 f"total_messages={self.total_ingested_messages}, rate={rate:.2f}/s"
+            )
+
+    async def _send_deleted_message_log(
+        self,
+        guild_id: int,
+        delete_log_channel_id: int,
+        message_id: int,
+        fallback_channel_id: int | None,
+        snapshot: Dict[str, Any] | None,
+    ) -> None:
+        channel_obj = self.get_channel(delete_log_channel_id)
+        if not isinstance(channel_obj, discord.TextChannel):
+            try:
+                fetched = await self.fetch_channel(delete_log_channel_id)
+                if isinstance(fetched, discord.TextChannel):
+                    channel_obj = fetched
+                else:
+                    print(
+                        "[DeleteLog] Configured channel is not a text channel "
+                        f"guild={guild_id}, channel={delete_log_channel_id}"
+                    )
+                    return
+            except discord.HTTPException as exc:
+                print(
+                    "[DeleteLog] Failed to resolve delete log channel "
+                    f"guild={guild_id}, channel={delete_log_channel_id}: {exc}"
+                )
+                return
+
+        deleted_at = datetime.now(timezone.utc)
+
+        author_id = int(snapshot.get("author_id", 0)) if snapshot else 0
+        author_display_name = to_text(snapshot.get("author_display_name")) if snapshot else ""
+        author_avatar_url = to_text(snapshot.get("author_avatar_url")) if snapshot else ""
+        content = to_text(snapshot.get("content")) if snapshot else ""
+        channel_id = int(snapshot.get("channel_id", 0)) if snapshot else 0
+        if channel_id == 0 and fallback_channel_id is not None:
+            channel_id = fallback_channel_id
+        created_at = snapshot.get("created_at") if snapshot else None
+        attachments = snapshot.get("attachments", []) if snapshot else []
+        stickers = snapshot.get("stickers", []) if snapshot else []
+        custom_emojis = snapshot.get("custom_emojis", []) if snapshot else []
+
+        if snapshot is None:
+            print(
+                "[DeleteLog] No snapshot found for deleted message "
+                f"guild={guild_id}, message_id={message_id}, fallback_channel={fallback_channel_id}"
+            )
+
+        if created_at is not None and isinstance(created_at, str):
+            try:
+                created_at = datetime.fromisoformat(created_at)
+            except ValueError:
+                created_at = None
+
+        guild = self.get_guild(guild_id)
+        if author_id and guild is not None and (
+            not author_display_name or author_display_name.startswith("user-")
+        ):
+            member = guild.get_member(author_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(author_id)
+                except discord.HTTPException:
+                    member = None
+            if member is not None:
+                author_display_name = member.display_name
+                if not author_avatar_url:
+                    author_avatar_url = str(member.display_avatar.url)
+
+        if not author_display_name:
+            author_display_name = f"user-{author_id}" if author_id else "未知使用者"
+
+        embed = discord.Embed(
+            title="訊息刪除紀錄",
+            color=discord.Color.red(),
+            timestamp=deleted_at,
+        )
+        embed.set_author(
+            name=author_display_name,
+            icon_url=author_avatar_url if author_avatar_url else None,
+        )
+
+        if author_id:
+            embed.add_field(name="使用者", value=f"<@{author_id}>", inline=True)
+        if channel_id:
+            embed.add_field(name="原頻道", value=f"<#{channel_id}>", inline=True)
+        embed.add_field(
+            name="刪除時間",
+            value=f"<t:{int(deleted_at.timestamp())}:F>",
+            inline=True,
+        )
+        if isinstance(created_at, datetime):
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            embed.add_field(
+                name="原訊息時間",
+                value=f"<t:{int(created_at.timestamp())}:F>",
+                inline=True,
+            )
+
+        embed.add_field(
+            name="訊息內容",
+            value=truncate_text(content, 1000)
+            if content.strip()
+            else (
+                "(無文字內容，且未留存附件/貼圖快照)"
+                if not attachments and not stickers and not custom_emojis
+                else "(無文字內容)"
+            ),
+            inline=False,
+        )
+
+        if stickers:
+            sticker_lines = []
+            for index, item in enumerate(stickers):
+                if index >= 6:
+                    sticker_lines.append(f"... and {len(stickers) - 6} more")
+                    break
+                name = to_text(item.get("name")) or "sticker"
+                sticker_id = to_text(item.get("id"))
+                format_name = to_text(item.get("format")).upper()
+                sticker_url = to_text(item.get("url"))
+                line = name
+                if sticker_id:
+                    line = f"{line} (`{sticker_id}`)"
+                if format_name:
+                    line = f"{line} [{format_name}]"
+                if sticker_url:
+                    line = f"{line} [link]({sticker_url})"
+                sticker_lines.append(line)
+            if sticker_lines:
+                embed.add_field(name="貼圖", value=truncate_text("\n".join(sticker_lines), 1000), inline=False)
+
+        if custom_emojis:
+            emoji_items = []
+            for item in custom_emojis:
+                name = to_text(item.get("name"))
+                emoji_id = to_text(item.get("id"))
+                if name and emoji_id:
+                    emoji_items.append(f"{name} (`{emoji_id}`)")
+                elif name:
+                    emoji_items.append(name)
+            if emoji_items:
+                embed.add_field(
+                    name="自訂表情符號",
+                    value=truncate_text(", ".join(emoji_items), 1000),
+                    inline=False,
+                )
+
+        preview_image_url = ""
+        if attachments:
+            lines = []
+            for index, item in enumerate(attachments):
+                if index >= 8:
+                    lines.append(f"... and {len(attachments) - 8} more")
+                    break
+                filename = to_text(item.get("filename")) or "attachment"
+                url = to_text(item.get("url"))
+                content_type = to_text(item.get("content_type"))
+                line = f"[{filename}]({url})" if url else filename
+                if content_type:
+                    line = f"{line} ({content_type})"
+                lines.append(line)
+            if lines:
+                embed.add_field(name="附件", value=truncate_text("\n".join(lines), 1000), inline=False)
+
+            for item in attachments:
+                content_type = to_text(item.get("content_type")).lower()
+                url = to_text(item.get("url"))
+                filename = to_text(item.get("filename")).lower()
+                if not url:
+                    continue
+                if content_type.startswith("image/") or filename.endswith(
+                    (".png", ".jpg", ".jpeg", ".gif", ".webp")
+                ):
+                    preview_image_url = url
+                    break
+
+        if not preview_image_url and stickers:
+            for item in stickers:
+                sticker_url = to_text(item.get("url"))
+                if sticker_url and not sticker_url.endswith(".json"):
+                    preview_image_url = sticker_url
+                    break
+
+        if preview_image_url:
+            embed.set_image(url=preview_image_url)
+
+        embed.set_footer(text=f"message_id: {message_id}")
+
+        try:
+            await channel_obj.send(embed=embed)
+        except discord.HTTPException as exc:
+            print(
+                "[DeleteLog] Failed to send delete log message "
+                f"guild={guild_id}, channel={delete_log_channel_id}, message_id={message_id}: {exc}"
             )
 
     async def _run_startup_tasks(self) -> None:
@@ -563,6 +967,7 @@ class HotmapBot(discord.Client):
                     latest_seen = msg_time
                 if message.author.bot:
                     continue
+                snapshot = self._build_message_snapshot(message)
                 ok = await self.db.insert_message(
                     message_id=message.id,
                     guild_id=guild_id,
@@ -570,6 +975,12 @@ class HotmapBot(discord.Client):
                     channel_name=channel_name,
                     author_id=message.author.id,
                     created_at=message.created_at,
+                    content=snapshot["content"],
+                    author_display_name=snapshot["author_display_name"],
+                    author_avatar_url=snapshot["author_avatar_url"],
+                    attachments_json=json.dumps(snapshot["attachments"], ensure_ascii=False),
+                    stickers_json=json.dumps(snapshot["stickers"], ensure_ascii=False),
+                    custom_emojis_json=json.dumps(snapshot["custom_emojis"], ensure_ascii=False),
                 )
                 if ok:
                     inserted += 1
@@ -726,6 +1137,149 @@ def build_hotmap_command(bot: HotmapBot) -> app_commands.Command:
     return hotmap
 
 
+def build_set_delete_log_command(bot: HotmapBot) -> app_commands.Command:
+    @app_commands.command(
+        name="set_delete_log",
+        description="Set a channel to receive deleted message logs.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(channel="Target channel for deleted message logs")
+    async def set_delete_log(
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+    ) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You need server administrator permission to use this command.",
+                ephemeral=True,
+            )
+            return
+
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None or guild.me is None:
+            await interaction.response.send_message(
+                "Bot member state is not ready yet. Please try again later.",
+                ephemeral=True,
+            )
+            return
+
+        perms = channel.permissions_for(guild.me)
+        missing = []
+        if not perms.view_channel:
+            missing.append("View Channel")
+        if not perms.send_messages:
+            missing.append("Send Messages")
+        if not perms.embed_links:
+            missing.append("Embed Links")
+        if missing:
+            await interaction.response.send_message(
+                "Bot is missing permissions in target channel: " + ", ".join(missing),
+                ephemeral=True,
+            )
+            return
+
+        await bot.db.set_delete_log_channel(guild_id, channel.id)
+        await interaction.response.send_message(
+            f"Deleted message logs will be sent to {channel.mention}.",
+            ephemeral=True,
+        )
+
+    return set_delete_log
+
+
+def build_delete_log_status_command(bot: HotmapBot) -> app_commands.Command:
+    @app_commands.command(
+        name="delete_log_status",
+        description="Show deleted message log configuration and bot permissions.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def delete_log_status(interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You need server administrator permission to use this command.",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        guild_id = interaction.guild_id
+        if guild is None or guild_id is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        delete_log_channel_id = await bot.db.get_delete_log_channel(guild_id)
+        if delete_log_channel_id is None:
+            await interaction.response.send_message(
+                "Delete log channel is not set. Use /set_delete_log first.",
+                ephemeral=True,
+            )
+            return
+
+        channel_obj = bot.get_channel(delete_log_channel_id)
+        if channel_obj is None:
+            try:
+                channel_obj = await bot.fetch_channel(delete_log_channel_id)
+            except discord.HTTPException:
+                channel_obj = None
+
+        if not isinstance(channel_obj, discord.TextChannel):
+            await interaction.response.send_message(
+                f"Configured channel `{delete_log_channel_id}` is unavailable or not a text channel.",
+                ephemeral=True,
+            )
+            return
+
+        if guild.me is None:
+            await interaction.response.send_message(
+                "Bot member state is not ready yet. Please try again later.",
+                ephemeral=True,
+            )
+            return
+
+        perms = channel_obj.permissions_for(guild.me)
+        missing = []
+        if not perms.view_channel:
+            missing.append("View Channel")
+        if not perms.send_messages:
+            missing.append("Send Messages")
+        if not perms.embed_links:
+            missing.append("Embed Links")
+
+        if missing:
+            await interaction.response.send_message(
+                "Delete log channel: "
+                f"{channel_obj.mention}\n"
+                "Bot missing permissions: "
+                + ", ".join(missing),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "Delete log is configured correctly.\n"
+            f"Channel: {channel_obj.mention} (`{channel_obj.id}`)\n"
+            "Permissions: View Channel, Send Messages, Embed Links",
+            ephemeral=True,
+        )
+
+    return delete_log_status
+
+
 async def run() -> None:
     load_dotenv()
     settings = Settings.load()
@@ -740,6 +1294,8 @@ async def run() -> None:
 
     bot = HotmapBot(settings, db)
     bot.tree.add_command(build_hotmap_command(bot))
+    bot.tree.add_command(build_set_delete_log_command(bot))
+    bot.tree.add_command(build_delete_log_status_command(bot))
 
     @bot.tree.error
     async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:

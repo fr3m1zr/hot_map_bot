@@ -5,6 +5,8 @@ This project provides a scalable Discord bot architecture for large communities.
 ## Goal
 
 - Command: `/hotmap @user [days]`
+- Command: `/set_delete_log #channel`
+- Command: `/delete_log_status`
 - Output: text-based channel activity hotmap
 - Time window: up to 30 days
 - Permission: server administrators only
@@ -15,6 +17,7 @@ This project provides a scalable Discord bot architecture for large communities.
 - `discord.py` bot receives every guild message event (`on_message`)
 - Each message is persisted into PostgreSQL
 - Slash command aggregates message counts by channel for one target user
+- Bot can log deleted messages into a configured channel
 - Result is rendered as text bars for quick reading
 
 ## Data model
@@ -80,3 +83,37 @@ In Discord Developer Portal, enable intents used by this bot:
 
 - `SERVER MEMBERS INTENT`
 - `MESSAGE CONTENT INTENT`
+
+## Deleted message log feature
+
+- Use `/set_delete_log #channel` to configure a log channel.
+- Use `/delete_log_status` to verify channel config and bot permissions.
+- Supports both single delete and bulk delete events.
+- When a message is deleted, bot sends an embed containing:
+  - Original content
+  - User nickname and avatar
+  - Delete timestamp
+  - Attachment links (image/video/file)
+  - Sticker and custom emoji info
+
+### Required permissions for delete log channel
+
+The bot must have these permissions in the configured log channel:
+
+- `View Channel`
+- `Send Messages`
+- `Embed Links`
+
+Recommended:
+
+- `Read Message History`
+- `Attach Files`
+
+### Troubleshooting
+
+- Error: `Failed to send log message: 403 Forbidden (50013) Missing Permissions`
+  - Cause: Bot can read delete events but cannot send embed messages to the configured log channel.
+  - Fix:
+    1. Re-check channel override permissions for bot role/user.
+    2. Run `/delete_log_status` and ensure all required permissions pass.
+    3. Re-run `/set_delete_log #channel` after permission updates.
