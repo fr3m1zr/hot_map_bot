@@ -20,6 +20,31 @@ LOW_ACTIVITY_RATIO_THRESHOLD = 0.005
 OTHER_CATEGORY_LABEL = "其他"
 MAX_CHART_CHANNELS = 12
 CUSTOM_EMOJI_REGEX = re.compile(r"<a?:([A-Za-z0-9_]+):(\d+)>")
+URL_REGEX = re.compile(r"https?://\S+", re.IGNORECASE)
+UNICODE_EMOJI_REGEX = re.compile(
+    r"[\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2600-\u27BF\u200d\ufe0f]"
+)
+
+MESSAGE_TYPE_ATTACHMENT = "附件"
+MESSAGE_TYPE_STICKER = "貼圖"
+MESSAGE_TYPE_LINK = "連結"
+MESSAGE_TYPE_EMOJI_ONLY = "表符"
+MESSAGE_TYPE_TEXT = "文字訊息"
+MESSAGE_TYPE_OTHER = "其他"
+MESSAGE_TYPE_ORDER = [
+    MESSAGE_TYPE_ATTACHMENT,
+    MESSAGE_TYPE_STICKER,
+    MESSAGE_TYPE_LINK,
+    MESSAGE_TYPE_EMOJI_ONLY,
+    MESSAGE_TYPE_TEXT,
+    MESSAGE_TYPE_OTHER,
+]
+
+OTHER_REASON_EMPTY_PENDING = "空內容訊息（待確認存取狀態）"
+OTHER_REASON_INACCESSIBLE = "無法存取的訊息（可能已刪除）"
+OTHER_REASON_ACCESSIBLE_EMPTY = "可存取但空內容（系統/特殊訊息）"
+OTHER_REASON_EMPTY_WITH_STRUCTURED_DATA = "內容為空（但存在結構資料）"
+OTHER_REASON_UNRECOGNIZED = "未識別格式"
 
 
 def format_count(n: int) -> str:
@@ -40,6 +65,59 @@ def truncate_text(text: str, limit: int = 1000) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3].rstrip() + "..."
+
+
+def json_item_count(raw: str) -> int:
+    text = raw.strip()
+    if text in ("", "[]", "null", "None"):
+        return 0
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # Keep backward-compatible behavior for malformed legacy rows.
+        return 1
+    if isinstance(parsed, list):
+        return len(parsed)
+    return 1
+
+
+def is_emoji_only_content(content: str) -> bool:
+    text = content.strip()
+    if not text:
+        return False
+    text = CUSTOM_EMOJI_REGEX.sub("", text)
+    text = UNICODE_EMOJI_REGEX.sub("", text)
+    return text.strip() == ""
+
+
+def classify_message_type(content: str, attachments_json: str, stickers_json: str) -> str:
+    has_attachment = json_item_count(attachments_json) > 0
+    has_sticker = json_item_count(stickers_json) > 0
+    has_link = bool(URL_REGEX.search(content))
+    emoji_only = is_emoji_only_content(content)
+
+    if has_attachment:
+        return MESSAGE_TYPE_ATTACHMENT
+    if has_sticker:
+        return MESSAGE_TYPE_STICKER
+    if has_link:
+        return MESSAGE_TYPE_LINK
+    if emoji_only:
+        return MESSAGE_TYPE_EMOJI_ONLY
+    if content.strip():
+        return MESSAGE_TYPE_TEXT
+    return MESSAGE_TYPE_OTHER
+
+
+def classify_other_reason(content: str, attachments_json: str, stickers_json: str) -> str:
+    text = content.strip()
+    attachment_count = json_item_count(attachments_json)
+    sticker_count = json_item_count(stickers_json)
+    if not text:
+        if attachment_count == 0 and sticker_count == 0:
+            return OTHER_REASON_EMPTY_PENDING
+        return OTHER_REASON_EMPTY_WITH_STRUCTURED_DATA
+    return OTHER_REASON_UNRECOGNIZED
 
 
 def aggregate_hotmap_rows(rows: List[Tuple[str, int]]) -> Tuple[List[Tuple[str, int]], int]:
@@ -332,6 +410,284 @@ def render_hotmap_chart(
     return output
 
 
+def render_message_type_text(
+    user_label: str,
+    days: int,
+    type_counts: Dict[str, int],
+    total_messages: int,
+    other_reason_counts: Dict[str, int],
+) -> str:
+    if total_messages <= 0:
+        return (
+            f"Here is {user_label} in last {days} day(s) message type chart\n"
+            "No messages found."
+        )
+
+    lines = [f"Here is {user_label} in last {days} day(s) message type chart"]
+    for key in MESSAGE_TYPE_ORDER:
+        count = type_counts.get(key, 0)
+        ratio = (count / total_messages) * 100 if total_messages > 0 else 0
+        lines.append(f"{key}: {format_count(count)} ({ratio:.1f}%)")
+
+    other_total = type_counts.get(MESSAGE_TYPE_OTHER, 0)
+    if other_total > 0 and other_reason_counts:
+        lines.append("")
+        lines.append("其他細分:")
+        sorted_items = sorted(other_reason_counts.items(), key=lambda x: x[1], reverse=True)
+        for reason, count in sorted_items:
+            ratio = (count / other_total) * 100 if other_total > 0 else 0
+            lines.append(f"- {reason}: {format_count(count)} ({ratio:.1f}%)")
+
+        pending_count = other_reason_counts.get(OTHER_REASON_EMPTY_PENDING, 0)
+        if pending_count > 0:
+            lines.append("")
+            lines.append(
+                f"診斷提示: 有 {format_count(pending_count)} 則空內容訊息待確認存取狀態，"
+                "可使用 /msgtype_debug 進一步判定是否已刪除、權限不足或系統訊息。"
+            )
+    return "\n".join(lines)
+
+
+def render_message_type_debug_text(
+    user_label: str,
+    days: int,
+    total_messages: int,
+    type_counts: Dict[str, int],
+    other_reason_counts: Dict[str, int],
+    problematic_channels: List[Tuple[int, str, int]],
+    first_problem_time: datetime | None,
+    last_problem_time: datetime | None,
+    sample_message_ids: List[int],
+    access_check_counts: Dict[str, int],
+    access_check_details: List[str],
+) -> str:
+    lines = [f"Here is {user_label} in last {days} day(s) message snapshot debug"]
+    lines.append(f"總訊息數: {format_count(total_messages)}")
+    lines.append(f"其他類別數: {format_count(type_counts.get(MESSAGE_TYPE_OTHER, 0))}")
+
+    inaccessible_count = other_reason_counts.get(OTHER_REASON_INACCESSIBLE, 0)
+    accessible_empty_count = other_reason_counts.get(OTHER_REASON_ACCESSIBLE_EMPTY, 0)
+    pending_count = other_reason_counts.get(OTHER_REASON_EMPTY_PENDING, 0)
+    lines.append(f"無法存取訊息: {format_count(inaccessible_count)}")
+    if accessible_empty_count > 0:
+        lines.append(f"可存取但空內容: {format_count(accessible_empty_count)}")
+    if pending_count > 0:
+        lines.append(f"待確認存取狀態: {format_count(pending_count)}")
+
+    if not other_reason_counts:
+        lines.append("未偵測到其他類別異常。")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("其他細分:")
+    for reason, count in sorted(other_reason_counts.items(), key=lambda x: x[1], reverse=True):
+        lines.append(f"- {reason}: {format_count(count)}")
+
+    if problematic_channels:
+        lines.append("")
+        lines.append("空內容訊息頻道 Top:")
+        for channel_id, channel_name, count in problematic_channels[:8]:
+            lines.append(f"- <#{channel_id}> ({channel_name}): {format_count(count)}")
+
+    if first_problem_time is not None and last_problem_time is not None:
+        lines.append("")
+        lines.append(
+            "問題時間範圍: "
+            f"{first_problem_time.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} "
+            f"~ {last_problem_time.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+
+    if sample_message_ids:
+        lines.append("")
+        sample_text = ", ".join(str(mid) for mid in sample_message_ids[:10])
+        lines.append(f"樣本 message_id: {sample_text}")
+
+    if access_check_counts:
+        lines.append("")
+        lines.append("樣本存取檢查:")
+        ordered = ["可存取", "已刪除或不存在", "權限不足", "頻道不可用", "其他錯誤"]
+        for key in ordered:
+            count = access_check_counts.get(key, 0)
+            if count > 0:
+                lines.append(f"- {key}: {format_count(count)}")
+        for detail in access_check_details[:8]:
+            lines.append(f"  - {detail}")
+
+    lines.append("")
+    lines.append("建議: 若無法存取訊息偏高，請確認私人討論串加入狀態、頻道讀取權限與回掃涵蓋範圍；若可存取但空內容偏高，通常是系統/特殊訊息。")
+    return "\n".join(lines)
+
+
+def render_message_type_pie_chart(
+    user_label: str,
+    days: int,
+    type_counts: Dict[str, int],
+    total_messages: int,
+) -> BytesIO:
+    width = 1200
+    height = 760
+    image = Image.new("RGB", (width, height), "#ffffff")
+    draw = ImageDraw.Draw(image)
+
+    title_font = load_chart_font(40, bold=True)
+    subtitle_font = load_chart_font(24)
+    label_font = load_chart_font(28, bold=True)
+    value_font = load_chart_font(22)
+    center_value_font = load_chart_font(46, bold=True)
+    center_label_font = load_chart_font(22)
+
+    colors = {
+        MESSAGE_TYPE_ATTACHMENT: "#2563eb",
+        MESSAGE_TYPE_STICKER: "#7c3aed",
+        MESSAGE_TYPE_LINK: "#059669",
+        MESSAGE_TYPE_EMOJI_ONLY: "#d97706",
+        MESSAGE_TYPE_TEXT: "#0891b2",
+        MESSAGE_TYPE_OTHER: "#98a2b3",
+    }
+
+    title = fit_text(draw, f"{user_label} 的訊息種類分布", title_font, 980)
+    draw.text((46, 34), title, fill="#111827", font=title_font)
+    draw.text((48, 92), f"最近 {days} 天", fill="#475467", font=subtitle_font)
+
+    if total_messages <= 0:
+        empty_text = "這段時間沒有可分析的訊息"
+        tw = draw.textlength(empty_text, font=label_font)
+        draw.text(((width - tw) / 2, 350), empty_text, fill="#475467", font=label_font)
+        output = BytesIO()
+        image.save(output, format="PNG")
+        output.seek(0)
+        return output
+
+    center_x = 350
+    center_y = 420
+    radius = 220
+    start_angle = -90.0
+    for key in MESSAGE_TYPE_ORDER:
+        value = type_counts.get(key, 0)
+        if value <= 0:
+            continue
+        sweep = 360.0 * (value / total_messages)
+        draw.pieslice(
+            (center_x - radius, center_y - radius, center_x + radius, center_y + radius),
+            start=start_angle,
+            end=start_angle + sweep,
+            fill=colors[key],
+        )
+        start_angle += sweep
+
+    inner_radius = 120
+    draw.ellipse(
+        (
+            center_x - inner_radius,
+            center_y - inner_radius,
+            center_x + inner_radius,
+            center_y + inner_radius,
+        ),
+        fill="#ffffff",
+    )
+    total_text = format_count(total_messages)
+    total_text_width = draw.textlength(total_text, font=center_value_font)
+    draw.text(
+        (center_x - total_text_width / 2, center_y - 46),
+        total_text,
+        fill="#111827",
+        font=center_value_font,
+    )
+    center_label = "總訊息"
+    center_label_width = draw.textlength(center_label, font=center_label_font)
+    draw.text(
+        (center_x - center_label_width / 2, center_y + 20),
+        center_label,
+        fill="#475467",
+        font=center_label_font,
+    )
+
+    legend_x = 670
+    legend_y = 175
+    row_height = 82
+    for idx, key in enumerate(MESSAGE_TYPE_ORDER):
+        y = legend_y + idx * row_height
+        value = type_counts.get(key, 0)
+        ratio = (value / total_messages) * 100 if total_messages > 0 else 0
+        draw.rounded_rectangle((legend_x, y + 14, legend_x + 24, y + 38), radius=6, fill=colors[key])
+        draw.text((legend_x + 42, y), key, fill="#111827", font=label_font)
+        draw.text(
+            (legend_x + 42, y + 42),
+            f"{format_count(value)} ({ratio:.1f}%)",
+            fill="#475467",
+            font=value_font,
+        )
+
+    output = BytesIO()
+    image.save(output, format="PNG")
+    output.seek(0)
+    return output
+
+
+async def check_message_access_samples(
+    bot: "HotmapBot",
+    guild: discord.Guild,
+    samples: List[Tuple[int, int, str]],
+) -> Tuple[Dict[str, int], List[str], Dict[int, str]]:
+    counts: Dict[str, int] = {}
+    details: List[str] = []
+    status_by_message_id: Dict[int, str] = {}
+
+    def add_status(status: str) -> None:
+        counts[status] = counts.get(status, 0) + 1
+
+    for message_id, channel_id, channel_name in samples:
+        channel_obj: discord.abc.GuildChannel | discord.Thread | None = guild.get_channel(channel_id)
+        if channel_obj is None:
+            channel_obj = guild.get_thread(channel_id)
+        if channel_obj is None:
+            try:
+                fetched = await bot.fetch_channel(channel_id)
+                if isinstance(fetched, (discord.TextChannel, discord.Thread)):
+                    channel_obj = fetched
+            except discord.Forbidden:
+                add_status("權限不足")
+                status_by_message_id[message_id] = "權限不足"
+                details.append(f"{message_id} / #{channel_name}: 權限不足")
+                continue
+            except discord.NotFound:
+                add_status("頻道不可用")
+                status_by_message_id[message_id] = "頻道不可用"
+                details.append(f"{message_id} / #{channel_name}: 頻道不存在")
+                continue
+            except discord.HTTPException:
+                add_status("其他錯誤")
+                status_by_message_id[message_id] = "其他錯誤"
+                details.append(f"{message_id} / #{channel_name}: 頻道查詢失敗")
+                continue
+
+        if not isinstance(channel_obj, (discord.TextChannel, discord.Thread)):
+            add_status("頻道不可用")
+            status_by_message_id[message_id] = "頻道不可用"
+            details.append(f"{message_id} / #{channel_name}: 非可讀取文字頻道")
+            continue
+
+        try:
+            await channel_obj.fetch_message(message_id)
+            add_status("可存取")
+            status_by_message_id[message_id] = "可存取"
+            details.append(f"{message_id} / <#{channel_id}>: 可存取")
+        except discord.NotFound:
+            add_status("已刪除或不存在")
+            status_by_message_id[message_id] = "已刪除或不存在"
+            details.append(f"{message_id} / <#{channel_id}>: 已刪除或不存在")
+        except discord.Forbidden:
+            add_status("權限不足")
+            status_by_message_id[message_id] = "權限不足"
+            details.append(f"{message_id} / <#{channel_id}>: 權限不足")
+        except discord.HTTPException:
+            add_status("其他錯誤")
+            status_by_message_id[message_id] = "其他錯誤"
+            details.append(f"{message_id} / <#{channel_id}>: 讀取失敗")
+
+    return counts, details, status_by_message_id
+
+
 class HotmapBot(discord.Client):
     def __init__(self, settings: Settings, db: Database) -> None:
         intents = discord.Intents.default()
@@ -350,9 +706,12 @@ class HotmapBot(discord.Client):
         self.window_ingested_messages = 0
         self.metrics_task: asyncio.Task[None] | None = None
         self.startup_thread_scan_done = False
+        self.startup_cleanup_done = False
         self.startup_backfill_done = False
         self.history_backfill_on_startup = bool(self.settings.history_backfill_on_startup)
         self.history_backfill_days = max(1, min(180, int(self.settings.history_backfill_days)))
+        self.cleanup_on_startup = bool(self.settings.cleanup_on_startup)
+        self.cleanup_days = max(1, min(180, int(self.settings.cleanup_days)))
 
     async def setup_hook(self) -> None:
         print("Starting global slash command sync...")
@@ -375,6 +734,8 @@ class HotmapBot(discord.Client):
         if not message.guild:
             return
         if message.author.bot:
+            return
+        if message.is_system():
             return
 
         snapshot = self._build_message_snapshot(message)
@@ -908,13 +1269,28 @@ class HotmapBot(discord.Client):
         print(
             "[StartupConfig] "
             f"history_backfill_on_startup={self.history_backfill_on_startup}, "
-            f"history_backfill_days={self.history_backfill_days}"
+            f"history_backfill_days={self.history_backfill_days}, "
+            f"cleanup_on_startup={self.cleanup_on_startup}, cleanup_days={self.cleanup_days}"
         )
+
+        if not self.startup_cleanup_done and self.cleanup_on_startup:
+            self.startup_cleanup_done = True
+            await self._run_startup_cleanup_once()
+
         if not self.startup_backfill_done and self.history_backfill_on_startup:
             self.startup_backfill_done = True
             await self._run_history_backfill_once()
         else:
             print("[HistoryBackfill] Skipped by config or already handled.")
+
+    async def _run_startup_cleanup_once(self) -> None:
+        from_time = datetime.now(timezone.utc) - timedelta(days=self.cleanup_days)
+        print(
+            "[StartupCleanup] Start "
+            f"window={self.cleanup_days}d, from={from_time.isoformat()}"
+        )
+        deleted_count = await self.db.cleanup_empty_snapshot_messages(from_time=from_time)
+        print(f"[StartupCleanup] Done deleted_rows={deleted_count}")
 
     async def _auto_join_existing_threads(self) -> None:
         joined = 0
@@ -1065,6 +1441,8 @@ class HotmapBot(discord.Client):
                 if latest_seen is None or msg_time > latest_seen:
                     latest_seen = msg_time
                 if message.author.bot:
+                    continue
+                if message.is_system():
                     continue
                 snapshot = self._build_message_snapshot(message)
                 ok = await self.db.insert_message(
@@ -1236,6 +1614,354 @@ def build_hotmap_command(bot: HotmapBot) -> app_commands.Command:
     return hotmap
 
 
+def build_message_type_chart_command(bot: HotmapBot) -> app_commands.Command:
+    def format_user_label(interaction: discord.Interaction, user: discord.User) -> str:
+        guild = interaction.guild
+        if guild is not None:
+            target_member = guild.get_member(user.id)
+            if target_member is not None:
+                return f"@{target_member.display_name}"
+        return f"@{user.global_name or user.name}"
+
+    @app_commands.command(
+        name="msgtype",
+        description="Show message type pie chart (max 180 days).",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(user="Target user", days="Range in days (max 180)")
+    async def msgtype(
+        interaction: discord.Interaction,
+        user: discord.User,
+        days: app_commands.Range[int, 1, 180] | None = None,
+    ) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You need server administrator permission to use this command.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.followup.send(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        days_value = days or bot.settings.default_days
+        days_value = min(days_value, bot.settings.max_days)
+        from_time = datetime.now(timezone.utc) - timedelta(days=days_value)
+        rows = await bot.db.get_message_type_rows(
+            guild_id=guild_id,
+            author_id=user.id,
+            from_time=from_time,
+        )
+
+        type_counts = {key: 0 for key in MESSAGE_TYPE_ORDER}
+        other_reason_counts: Dict[str, int] = {}
+        for content, attachments_json, stickers_json in rows:
+            category = classify_message_type(content, attachments_json, stickers_json)
+            type_counts[category] = type_counts.get(category, 0) + 1
+            if category == MESSAGE_TYPE_OTHER:
+                reason = classify_other_reason(content, attachments_json, stickers_json)
+                other_reason_counts[reason] = other_reason_counts.get(reason, 0) + 1
+
+        total_messages = len(rows)
+        target_label = format_user_label(interaction, user)
+        chart_text = render_message_type_text(
+            user_label=target_label,
+            days=days_value,
+            type_counts=type_counts,
+            total_messages=total_messages,
+            other_reason_counts=other_reason_counts,
+        )
+        chart = render_message_type_pie_chart(
+            user_label=target_label,
+            days=days_value,
+            type_counts=type_counts,
+            total_messages=total_messages,
+        )
+        file = discord.File(chart, filename="message_type_chart.png")
+
+        print(
+            "[MsgType] "
+            f"guild={guild_id}, author={user.id}, days={days_value}, "
+            f"total_messages={total_messages}, counts={type_counts}, other_breakdown={other_reason_counts}"
+        )
+
+        await interaction.followup.send(f"```text\n{chart_text}\n```", file=file)
+
+    return msgtype
+
+
+def build_message_type_debug_command(bot: HotmapBot) -> app_commands.Command:
+    def format_user_label(interaction: discord.Interaction, user: discord.User) -> str:
+        guild = interaction.guild
+        if guild is not None:
+            target_member = guild.get_member(user.id)
+            if target_member is not None:
+                return f"@{target_member.display_name}"
+        return f"@{user.global_name or user.name}"
+
+    @app_commands.command(
+        name="msgtype_debug",
+        description="Debug message snapshot quality for message type analysis.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(user="Target user", days="Range in days (max 180)")
+    async def msgtype_debug(
+        interaction: discord.Interaction,
+        user: discord.User,
+        days: app_commands.Range[int, 1, 180] | None = None,
+    ) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You need server administrator permission to use this command.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.followup.send(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        days_value = days or bot.settings.default_days
+        days_value = min(days_value, bot.settings.max_days)
+        from_time = datetime.now(timezone.utc) - timedelta(days=days_value)
+        rows = await bot.db.get_message_type_debug_rows(
+            guild_id=guild_id,
+            author_id=user.id,
+            from_time=from_time,
+        )
+
+        type_counts = {key: 0 for key in MESSAGE_TYPE_ORDER}
+        other_reason_counts: Dict[str, int] = {}
+        pending_channel_counts: Dict[Tuple[int, str], int] = {}
+        first_problem_time: datetime | None = None
+        last_problem_time: datetime | None = None
+        sample_message_ids: List[int] = []
+        sample_messages: List[Tuple[int, int, str]] = []
+
+        for message_id, channel_id, channel_name, created_at, content, attachments_json, stickers_json in rows:
+            category = classify_message_type(content, attachments_json, stickers_json)
+            type_counts[category] = type_counts.get(category, 0) + 1
+
+            if category != MESSAGE_TYPE_OTHER:
+                continue
+
+            reason = classify_other_reason(content, attachments_json, stickers_json)
+            other_reason_counts[reason] = other_reason_counts.get(reason, 0) + 1
+
+            if reason != OTHER_REASON_EMPTY_PENDING:
+                continue
+
+            key = (channel_id, channel_name)
+            pending_channel_counts[key] = pending_channel_counts.get(key, 0) + 1
+
+            if isinstance(created_at, datetime):
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                if first_problem_time is None or created_at < first_problem_time:
+                    first_problem_time = created_at
+                if last_problem_time is None or created_at > last_problem_time:
+                    last_problem_time = created_at
+
+            if len(sample_message_ids) < 10:
+                sample_message_ids.append(message_id)
+                sample_messages.append((message_id, channel_id, channel_name))
+
+        problematic_channels = sorted(
+            [(cid, cname, cnt) for (cid, cname), cnt in pending_channel_counts.items()],
+            key=lambda x: x[2],
+            reverse=True,
+        )
+
+        access_check_counts: Dict[str, int] = {}
+        access_check_details: List[str] = []
+        status_by_message_id: Dict[int, str] = {}
+        guild = interaction.guild
+        if guild is not None and sample_messages:
+            access_check_counts, access_check_details, status_by_message_id = await check_message_access_samples(
+                bot=bot,
+                guild=guild,
+                samples=sample_messages,
+            )
+
+        resolved_reason_counts = dict(other_reason_counts)
+        pending_count = resolved_reason_counts.get(OTHER_REASON_EMPTY_PENDING, 0)
+        checked_count = len(status_by_message_id)
+        if pending_count > 0 and checked_count > 0:
+            accessible_checked = sum(1 for status in status_by_message_id.values() if status == "可存取")
+            inaccessible_checked = checked_count - accessible_checked
+            remaining_pending = max(0, pending_count - checked_count)
+            if remaining_pending > 0:
+                resolved_reason_counts[OTHER_REASON_EMPTY_PENDING] = remaining_pending
+            else:
+                resolved_reason_counts.pop(OTHER_REASON_EMPTY_PENDING, None)
+
+            if accessible_checked > 0:
+                resolved_reason_counts[OTHER_REASON_ACCESSIBLE_EMPTY] = (
+                    resolved_reason_counts.get(OTHER_REASON_ACCESSIBLE_EMPTY, 0) + accessible_checked
+                )
+            if inaccessible_checked > 0:
+                resolved_reason_counts[OTHER_REASON_INACCESSIBLE] = (
+                    resolved_reason_counts.get(OTHER_REASON_INACCESSIBLE, 0) + inaccessible_checked
+                )
+
+        debug_text = render_message_type_debug_text(
+            user_label=format_user_label(interaction, user),
+            days=days_value,
+            total_messages=len(rows),
+            type_counts=type_counts,
+            other_reason_counts=resolved_reason_counts,
+            problematic_channels=problematic_channels,
+            first_problem_time=first_problem_time,
+            last_problem_time=last_problem_time,
+            sample_message_ids=sample_message_ids,
+            access_check_counts=access_check_counts,
+            access_check_details=access_check_details,
+        )
+
+        print(
+            "[MsgTypeDebug] "
+            f"guild={guild_id}, author={user.id}, days={days_value}, "
+            f"total_messages={len(rows)}, other_breakdown={resolved_reason_counts}, "
+            f"problem_channels={problematic_channels[:5]}"
+        )
+        await interaction.followup.send(f"```text\n{debug_text}\n```", ephemeral=True)
+
+    return msgtype_debug
+
+
+def build_message_inspect_command(bot: HotmapBot) -> app_commands.Command:
+    @app_commands.command(
+        name="msginspect",
+        description="Inspect one message by message_id from Discord and DB snapshot.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(message_id="Target message ID")
+    async def msginspect(
+        interaction: discord.Interaction,
+        message_id: str,
+    ) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You need server administrator permission to use this command.",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        message_id_str = message_id.strip()
+        if not message_id_str.isdigit():
+            await interaction.followup.send(
+                "message_id must be a numeric Discord snowflake.",
+                ephemeral=True,
+            )
+            return
+        message_id_int = int(message_id_str)
+
+        db_row = await bot.db.get_message_snapshot(message_id_int)
+        if db_row is None:
+            await interaction.followup.send(
+                f"message_id `{message_id_int}` not found in DB snapshot.",
+                ephemeral=True,
+            )
+            return
+
+        snapshot = bot._build_snapshot_from_db_row(db_row)
+        channel_id = int(snapshot.get("channel_id", 0))
+        channel_obj: discord.abc.GuildChannel | discord.Thread | None = guild.get_channel(channel_id)
+        if channel_obj is None:
+            channel_obj = guild.get_thread(channel_id)
+        if channel_obj is None:
+            try:
+                fetched = await bot.fetch_channel(channel_id)
+                if isinstance(fetched, (discord.TextChannel, discord.Thread)):
+                    channel_obj = fetched
+            except discord.HTTPException:
+                channel_obj = None
+
+        live_status = "未知"
+        live_details: List[str] = []
+        if not isinstance(channel_obj, (discord.TextChannel, discord.Thread)):
+            live_status = "頻道不可用或無法讀取"
+        else:
+            try:
+                live_msg = await channel_obj.fetch_message(message_id_int)
+                live_status = "可存取"
+                live_type = to_text(getattr(live_msg.type, "name", live_msg.type))
+                live_details.append(f"- type: {live_type}")
+                live_details.append(f"- is_system: {live_msg.is_system()}")
+                live_details.append(f"- content: {repr(live_msg.content)}")
+                live_details.append(f"- attachments: {len(live_msg.attachments)}")
+                live_details.append(f"- stickers: {len(live_msg.stickers)}")
+                live_details.append(f"- jump_url: {live_msg.jump_url}")
+            except discord.NotFound:
+                live_status = "已刪除或不存在"
+            except discord.Forbidden:
+                live_status = "權限不足"
+            except discord.HTTPException as exc:
+                live_status = f"讀取失敗: {exc}"
+
+        db_content = to_text(snapshot.get("content"))
+        db_attachments = snapshot.get("attachments", [])
+        db_stickers = snapshot.get("stickers", [])
+        db_reason = classify_other_reason(
+            db_content,
+            json.dumps(db_attachments, ensure_ascii=False),
+            json.dumps(db_stickers, ensure_ascii=False),
+        )
+
+        lines = [
+            f"message_id: {message_id_int}",
+            f"channel: <#{channel_id}> ({to_text(snapshot.get('channel_name'))})",
+            f"Discord即時狀態: {live_status}",
+            "",
+            "DB快照:",
+            f"- created_at: {snapshot.get('created_at')}",
+            f"- author_id: {snapshot.get('author_id')}",
+            f"- content: {repr(db_content)}",
+            f"- attachments: {len(db_attachments)}",
+            f"- stickers: {len(db_stickers)}",
+            f"- custom_emojis: {len(snapshot.get('custom_emojis', []))}",
+            f"- 分類推論: {db_reason}",
+        ]
+
+        if live_details:
+            lines.append("")
+            lines.append("Discord即時內容:")
+            lines.extend(live_details)
+
+        await interaction.followup.send(f"```text\n{chr(10).join(lines)}\n```", ephemeral=True)
+
+    return msginspect
+
+
 def build_set_delete_log_command(bot: HotmapBot) -> app_commands.Command:
     @app_commands.command(
         name="set_delete_log",
@@ -1386,13 +2112,18 @@ async def run() -> None:
         "[Settings] "
         f"default_days={settings.default_days}, max_days={settings.max_days}, "
         f"history_backfill_on_startup={settings.history_backfill_on_startup}, "
-        f"history_backfill_days={settings.history_backfill_days}"
+        f"history_backfill_days={settings.history_backfill_days}, "
+        f"cleanup_on_startup={settings.cleanup_on_startup}, "
+        f"cleanup_days={settings.cleanup_days}"
     )
     db = Database(settings.database_url)
     await db.connect()
 
     bot = HotmapBot(settings, db)
     bot.tree.add_command(build_hotmap_command(bot))
+    bot.tree.add_command(build_message_type_chart_command(bot))
+    bot.tree.add_command(build_message_type_debug_command(bot))
+    bot.tree.add_command(build_message_inspect_command(bot))
     bot.tree.add_command(build_set_delete_log_command(bot))
     bot.tree.add_command(build_delete_log_status_command(bot))
 

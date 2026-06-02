@@ -154,6 +154,12 @@ class Database:
         WHERE guild_id = $1
           AND author_id = $2
           AND created_at >= $3
+          AND (
+            content <> ''
+            OR attachments_json <> '[]'
+            OR stickers_json <> '[]'
+            OR custom_emojis_json <> '[]'
+          )
         GROUP BY channel_name
         ORDER BY cnt DESC;
         """
@@ -173,7 +179,13 @@ class Database:
         FROM messages
         WHERE guild_id = $1
           AND author_id = $2
-          AND created_at >= $3;
+          AND created_at >= $3
+          AND (
+            content <> ''
+            OR attachments_json <> '[]'
+            OR stickers_json <> '[]'
+            OR custom_emojis_json <> '[]'
+          );
         """
         async with self.pool.acquire() as conn:
             value = await conn.fetchval(query, guild_id, author_id, from_time)
@@ -189,7 +201,13 @@ class Database:
         SELECT COUNT(*)::BIGINT
         FROM messages
         WHERE author_id = $1
-          AND created_at >= $2;
+          AND created_at >= $2
+          AND (
+            content <> ''
+            OR attachments_json <> '[]'
+            OR stickers_json <> '[]'
+            OR custom_emojis_json <> '[]'
+          );
         """
         async with self.pool.acquire() as conn:
             value = await conn.fetchval(query, author_id, from_time)
@@ -206,12 +224,89 @@ class Database:
         FROM messages
         WHERE author_id = $1
           AND created_at >= $2
+          AND (
+            content <> ''
+            OR attachments_json <> '[]'
+            OR stickers_json <> '[]'
+            OR custom_emojis_json <> '[]'
+          )
         GROUP BY guild_id
         ORDER BY cnt DESC;
         """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(query, author_id, from_time)
             return [(int(r["guild_id"]), int(r["cnt"])) for r in rows]
+
+    async def get_message_type_rows(
+        self,
+        guild_id: int,
+        author_id: int,
+        from_time: datetime,
+    ) -> List[Tuple[str, str, str]]:
+        assert self.pool is not None
+        query = """
+        SELECT
+            content,
+            attachments_json,
+            stickers_json
+        FROM messages
+        WHERE guild_id = $1
+          AND author_id = $2
+          AND created_at >= $3
+          AND (
+            content <> ''
+            OR attachments_json <> '[]'
+            OR stickers_json <> '[]'
+            OR custom_emojis_json <> '[]'
+          );
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, guild_id, author_id, from_time)
+            return [
+                (
+                    str(r["content"] or ""),
+                    str(r["attachments_json"] or "[]"),
+                    str(r["stickers_json"] or "[]"),
+                )
+                for r in rows
+            ]
+
+    async def get_message_type_debug_rows(
+        self,
+        guild_id: int,
+        author_id: int,
+        from_time: datetime,
+    ) -> List[Tuple[int, int, str, datetime, str, str, str]]:
+        assert self.pool is not None
+        query = """
+        SELECT
+            id,
+            channel_id,
+            channel_name,
+            created_at,
+            content,
+            attachments_json,
+            stickers_json
+        FROM messages
+        WHERE guild_id = $1
+          AND author_id = $2
+          AND created_at >= $3
+        ORDER BY created_at ASC;
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, guild_id, author_id, from_time)
+            return [
+                (
+                    int(r["id"]),
+                    int(r["channel_id"]),
+                    str(r["channel_name"] or "unknown-channel"),
+                    r["created_at"],
+                    str(r["content"] or ""),
+                    str(r["attachments_json"] or "[]"),
+                    str(r["stickers_json"] or "[]"),
+                )
+                for r in rows
+            ]
 
     async def get_kv(self, key: str) -> str | None:
         assert self.pool is not None
@@ -290,3 +385,36 @@ class Database:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(query, message_id)
             return dict(row) if row is not None else None
+
+    async def get_message_snapshots(self, message_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        if not message_ids:
+            return {}
+        assert self.pool is not None
+        query = """
+        SELECT
+            id, guild_id, channel_id, channel_name, author_id, created_at,
+            content, author_display_name, author_avatar_url,
+            attachments_json, stickers_json, custom_emojis_json
+        FROM messages
+        WHERE id = ANY($1::BIGINT[]);
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, message_ids)
+            return {int(r["id"]): dict(r) for r in rows}
+
+    async def cleanup_empty_snapshot_messages(self, from_time: datetime) -> int:
+        assert self.pool is not None
+        query = """
+        DELETE FROM messages
+        WHERE created_at >= $1
+          AND content = ''
+          AND attachments_json = '[]'
+          AND stickers_json = '[]'
+          AND custom_emojis_json = '[]';
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(query, from_time)
+            try:
+                return int(result.split()[-1])
+            except (IndexError, ValueError):
+                return 0
