@@ -751,18 +751,32 @@ class HotmapBot(discord.Client):
                     break
                 name = to_text(item.get("name")) or "sticker"
                 sticker_id = to_text(item.get("id"))
-                format_name = to_text(item.get("format")).upper()
+                format_name_raw = to_text(item.get("format")).lower()
+                format_name = format_name_raw.upper()
                 sticker_url = to_text(item.get("url"))
+                sticker_preview_url = to_text(item.get("preview_url"))
                 sticker_page_url = to_text(item.get("page_url"))
+
+                sticker_id_int = 0
+                if sticker_id.isdigit():
+                    sticker_id_int = int(sticker_id)
+                fallback_urls = self._build_sticker_asset_urls(sticker_id_int, format_name_raw)
+                open_url = (
+                    sticker_preview_url
+                    or sticker_url
+                    or fallback_urls["preview_url"]
+                    or fallback_urls["asset_url"]
+                    or sticker_page_url
+                    or fallback_urls["page_url"]
+                )
+
                 line = name
                 if sticker_id:
                     line = f"{line} (`{sticker_id}`)"
                 if format_name:
                     line = f"{line} [{format_name}]"
-                if sticker_page_url:
-                    line = f"{line} [open]({sticker_page_url})"
-                elif sticker_url:
-                    line = f"{line} [open]({sticker_url})"
+                if open_url:
+                    line = f"{line} [open]({open_url})"
                 sticker_lines.append(line)
             if sticker_lines:
                 embed.add_field(name="貼圖", value=truncate_text("\n".join(sticker_lines), 1000), inline=False)
@@ -822,9 +836,19 @@ class HotmapBot(discord.Client):
 
         if not preview_image_url and stickers:
             for item in stickers:
+                sticker_id = to_text(item.get("id"))
+                format_name_raw = to_text(item.get("format")).lower()
                 sticker_preview_url = to_text(item.get("preview_url"))
                 sticker_url = to_text(item.get("url"))
-                candidate = sticker_preview_url or sticker_url
+
+                sticker_id_int = int(sticker_id) if sticker_id.isdigit() else 0
+                fallback_urls = self._build_sticker_asset_urls(sticker_id_int, format_name_raw)
+                candidate = (
+                    sticker_preview_url
+                    or sticker_url
+                    or fallback_urls["preview_url"]
+                    or fallback_urls["asset_url"]
+                )
                 if candidate and not candidate.endswith(".json"):
                     preview_image_url = candidate
                     break
