@@ -416,6 +416,7 @@ class HotmapBot(discord.Client):
         )
 
         snapshot: Dict[str, Any] | None = None
+        cached_attachments: List[discord.Attachment] | None = None
         if payload.cached_message is not None and not payload.cached_message.author.bot:
             snapshot = self._build_message_snapshot(payload.cached_message)
             snapshot["message_id"] = payload.cached_message.id
@@ -424,6 +425,7 @@ class HotmapBot(discord.Client):
             snapshot["channel_name"] = getattr(payload.cached_message.channel, "name", f"channel-{payload.cached_message.channel.id}")
             snapshot["author_id"] = payload.cached_message.author.id
             snapshot["created_at"] = payload.cached_message.created_at
+            cached_attachments = list(payload.cached_message.attachments)
         else:
             db_row = await self.db.get_message_snapshot(payload.message_id)
             if db_row is not None:
@@ -435,6 +437,7 @@ class HotmapBot(discord.Client):
             message_id=payload.message_id,
             fallback_channel_id=payload.channel_id,
             snapshot=snapshot,
+            cached_attachments=cached_attachments,
         )
 
     async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
@@ -456,6 +459,7 @@ class HotmapBot(discord.Client):
         )
 
         snapshot_by_id: Dict[int, Dict[str, Any]] = {}
+        cached_attachments_by_id: Dict[int, List[discord.Attachment]] = {}
         cached_messages = getattr(payload, "cached_messages", [])
         for message in cached_messages:
             if message.author.bot:
@@ -468,6 +472,7 @@ class HotmapBot(discord.Client):
             snapshot["author_id"] = message.author.id
             snapshot["created_at"] = message.created_at
             snapshot_by_id[message.id] = snapshot
+            cached_attachments_by_id[message.id] = list(message.attachments)
 
         uncached_ids = [mid for mid in message_ids if mid not in snapshot_by_id]
         if uncached_ids:
@@ -482,6 +487,7 @@ class HotmapBot(discord.Client):
                 message_id=message_id,
                 fallback_channel_id=payload.channel_id,
                 snapshot=snapshot_by_id.get(message_id),
+                cached_attachments=cached_attachments_by_id.get(message_id),
             )
 
     async def on_thread_create(self, thread: discord.Thread) -> None:
@@ -495,6 +501,7 @@ class HotmapBot(discord.Client):
                 {
                     "filename": attachment.filename,
                     "url": attachment.url,
+                    "proxy_url": attachment.proxy_url,
                     "content_type": attachment.content_type or "",
                     "size": attachment.size,
                 }
@@ -508,8 +515,13 @@ class HotmapBot(discord.Client):
                 format_name = to_text(getattr(format_value, "name", format_value)).lower()
 
             sticker_url = to_text(getattr(sticker, "url", ""))
+            sticker_urls = self._build_sticker_asset_urls(sticker.id, format_name)
             if not sticker_url:
-                sticker_url = self._build_sticker_asset_url(sticker.id, format_name)
+                sticker_url = sticker_urls["asset_url"]
+            preview_url = sticker_url
+            if format_name == "gif" and sticker_urls["preview_url"]:
+                preview_url = sticker_urls["preview_url"]
+            page_url = sticker_urls["page_url"]
 
             stickers.append(
                 {
@@ -517,6 +529,8 @@ class HotmapBot(discord.Client):
                     "name": sticker.name,
                     "format": format_name,
                     "url": sticker_url,
+                    "preview_url": preview_url,
+                    "page_url": page_url,
                 }
             )
 
@@ -550,15 +564,25 @@ class HotmapBot(discord.Client):
             "custom_emojis": custom_emojis,
         }
 
-    def _build_sticker_asset_url(self, sticker_id: int, format_name: str) -> str:
+    def _build_sticker_asset_urls(self, sticker_id: int, format_name: str) -> Dict[str, str]:
         if sticker_id <= 0:
-            return ""
-        ext = "png"
+            return {"asset_url": "", "preview_url": "", "page_url": ""}
+
+        base = f"https://media.discordapp.net/stickers/{sticker_id}"
+        asset_url = f"{base}.png"
+        preview_url = asset_url
         if format_name in {"gif"}:
-            ext = "gif"
+            asset_url = f"{base}.gif"
+            preview_url = f"{base}.png"
         elif format_name in {"lottie"}:
-            ext = "json"
-        return f"https://media.discordapp.net/stickers/{sticker_id}.{ext}"
+            asset_url = f"{base}.json"
+            preview_url = ""
+
+        return {
+            "asset_url": asset_url,
+            "preview_url": preview_url,
+            "page_url": f"https://discord.com/stickers/{sticker_id}",
+        }
 
     def _build_snapshot_from_db_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
         def parse_json_list(raw: Any) -> List[Any]:
@@ -614,6 +638,7 @@ class HotmapBot(discord.Client):
         message_id: int,
         fallback_channel_id: int | None,
         snapshot: Dict[str, Any] | None,
+        cached_attachments: List[discord.Attachment] | None = None,
     ) -> None:
         channel_obj = self.get_channel(delete_log_channel_id)
         if not isinstance(channel_obj, discord.TextChannel):
@@ -728,13 +753,16 @@ class HotmapBot(discord.Client):
                 sticker_id = to_text(item.get("id"))
                 format_name = to_text(item.get("format")).upper()
                 sticker_url = to_text(item.get("url"))
+                sticker_page_url = to_text(item.get("page_url"))
                 line = name
                 if sticker_id:
                     line = f"{line} (`{sticker_id}`)"
                 if format_name:
                     line = f"{line} [{format_name}]"
-                if sticker_url:
-                    line = f"{line} [link]({sticker_url})"
+                if sticker_page_url:
+                    line = f"{line} [open]({sticker_page_url})"
+                elif sticker_url:
+                    line = f"{line} [open]({sticker_url})"
                 sticker_lines.append(line)
             if sticker_lines:
                 embed.add_field(name="貼圖", value=truncate_text("\n".join(sticker_lines), 1000), inline=False)
@@ -756,6 +784,11 @@ class HotmapBot(discord.Client):
                 )
 
         preview_image_url = ""
+        upload_files: List[discord.File] = []
+        uploaded_image_filename = ""
+        if cached_attachments:
+            upload_files, uploaded_image_filename = await self._build_deleted_log_files(cached_attachments)
+
         if attachments:
             lines = []
             for index, item in enumerate(attachments):
@@ -763,7 +796,7 @@ class HotmapBot(discord.Client):
                     lines.append(f"... and {len(attachments) - 8} more")
                     break
                 filename = to_text(item.get("filename")) or "attachment"
-                url = to_text(item.get("url"))
+                url = to_text(item.get("url")) or to_text(item.get("proxy_url"))
                 content_type = to_text(item.get("content_type"))
                 line = f"[{filename}]({url})" if url else filename
                 if content_type:
@@ -774,7 +807,7 @@ class HotmapBot(discord.Client):
 
             for item in attachments:
                 content_type = to_text(item.get("content_type")).lower()
-                url = to_text(item.get("url"))
+                url = to_text(item.get("url")) or to_text(item.get("proxy_url"))
                 filename = to_text(item.get("filename")).lower()
                 if not url:
                     continue
@@ -784,25 +817,67 @@ class HotmapBot(discord.Client):
                     preview_image_url = url
                     break
 
+        if uploaded_image_filename:
+            preview_image_url = f"attachment://{uploaded_image_filename}"
+
         if not preview_image_url and stickers:
             for item in stickers:
+                sticker_preview_url = to_text(item.get("preview_url"))
                 sticker_url = to_text(item.get("url"))
-                if sticker_url and not sticker_url.endswith(".json"):
-                    preview_image_url = sticker_url
+                candidate = sticker_preview_url or sticker_url
+                if candidate and not candidate.endswith(".json"):
+                    preview_image_url = candidate
                     break
 
         if preview_image_url:
             embed.set_image(url=preview_image_url)
 
+        if attachments and not upload_files:
+            embed.add_field(
+                name="附件提示",
+                value="附件連結可能因 Discord CDN 時效而過期，建議儘快查看。",
+                inline=False,
+            )
+
         embed.set_footer(text=f"message_id: {message_id}")
 
         try:
-            await channel_obj.send(embed=embed)
+            send_kwargs: Dict[str, Any] = {"embed": embed}
+            if upload_files:
+                send_kwargs["files"] = upload_files
+            await channel_obj.send(**send_kwargs)
         except discord.HTTPException as exc:
             print(
                 "[DeleteLog] Failed to send delete log message "
                 f"guild={guild_id}, channel={delete_log_channel_id}, message_id={message_id}: {exc}"
             )
+
+    async def _build_deleted_log_files(
+        self,
+        cached_attachments: List[discord.Attachment],
+    ) -> Tuple[List[discord.File], str]:
+        files: List[discord.File] = []
+        image_filename = ""
+        max_file_count = 4
+        max_file_size = 8 * 1024 * 1024
+
+        for attachment in cached_attachments[:max_file_count]:
+            if attachment.size > max_file_size:
+                continue
+            try:
+                file = await attachment.to_file(use_cached=True)
+                files.append(file)
+                is_image = (attachment.content_type or "").lower().startswith("image/") or attachment.filename.lower().endswith(
+                    (".png", ".jpg", ".jpeg", ".gif", ".webp")
+                )
+                if not image_filename and is_image:
+                    image_filename = file.filename
+            except discord.HTTPException:
+                continue
+            except Exception:
+                continue
+
+        return files, image_filename
 
     async def _run_startup_tasks(self) -> None:
         await self._auto_join_existing_threads()
