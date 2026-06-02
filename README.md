@@ -1,119 +1,115 @@
-# Discord Hotmap Bot (Python + Docker)
+# Discord Hotmap Bot
 
-This project provides a scalable Discord bot architecture for large communities.
+一個以 Python + Docker 建置的 Discord 管理型機器人，提供：
 
-## Goal
+- 使用者頻道活躍度分析（`/hotmap`）
+- 訊息類型圓餅分析（`/msgtype`）
+- 訊息快照品質診斷（`/msgtype_debug`、`/msginspect`）
+- 刪除訊息稽核紀錄（`/set_delete_log`、`/delete_log_status`）
 
-- Command: `/hotmap @user [days]`
-- Command: `/set_delete_log #channel`
-- Command: `/delete_log_status`
-- Output: text-based channel activity hotmap
-- Time window: up to 30 days
-- Permission: server administrators only
-- Optimized for high traffic communities (example: 4,000 members, 20,000+ messages/day)
+---
 
-## Architecture
+## 系統架構
 
-- `discord.py` bot receives every guild message event (`on_message`)
-- Each message is persisted into PostgreSQL
-- Slash command aggregates message counts by channel for one target user
-- Bot can log deleted messages into a configured channel
-- Result is rendered as text bars for quick reading
+- **Bot Runtime**：`discord.py` 非同步事件驅動
+- **Data Store**：PostgreSQL（儲存訊息快照、統計來源資料、設定）
+- **Deployment**：Docker Compose（`bot` + `db`）
+- **Startup Tasks**：
+  - 討論串自動加入與掃描
+  - 可選歷史回補（backfill）
+  - 可選空快照清理（cleanup）
 
-## Data model
+---
 
-Table: `messages`
+## 目錄結構
 
-- `id`: Discord message id (primary key)
-- `guild_id`: guild id
-- `channel_id`: channel id
-- `channel_name`: channel name snapshot
-- `author_id`: message author id
-- `created_at`: message time
+- `src/main.py`：Bot 主程式、Slash Commands、分析圖表、事件處理
+- `src/db.py`：資料表初始化與查詢/寫入邏輯
+- `src/config.py`：環境變數與設定載入
+- `docker-compose.yml`：容器編排
+- `Dockerfile`：Bot 映像建置
+- `.env.example`：設定範本
 
-Index:
+---
 
-- `(author_id, created_at DESC)` for fast user+time range queries
+## 主要指令
 
-## Quick start
+- `/hotmap @user [days]`
+  - 頻道活躍度分析
+  - 預設天數由 `HOTMAP_DEFAULT_DAYS` 控制，最大由 `HOTMAP_MAX_DAYS` 控制
 
-1. Copy env:
+- `/msgtype @user [days]`
+  - 訊息類型分析（附件 / 貼圖 / 連結 / 表符 / 文字訊息 / 其他）
 
-   - `cp .env.example .env` (Linux/macOS)
-   - On Windows PowerShell: `Copy-Item .env.example .env`
+- `/msgtype_debug @user [days]`
+  - 針對 `其他` 類別做細分診斷
+  - 會做樣本存取檢查（可存取、已刪除、權限不足等）
 
-2. Fill values in `.env`:
+- `/msginspect message_id`
+  - 逐筆檢查特定訊息
+  - 對照 Discord 即時內容與 DB 快照內容
 
-   - `DISCORD_TOKEN`
-   - `DATABASE_URL` (default works with docker compose)
+- `/set_delete_log #channel`
+  - 設定刪除訊息紀錄頻道
 
-3. Start:
+- `/delete_log_status`
+  - 檢查刪除紀錄頻道設定與 bot 權限狀態
 
+> 所有管理指令預設需管理員權限。
+
+---
+
+## 環境變數
+
+### 必要
+
+- `DISCORD_TOKEN`
+- `DATABASE_URL`
+
+### 分析與回補
+
+- `HOTMAP_DEFAULT_DAYS`（預設查詢天數）
+- `HOTMAP_MAX_DAYS`（最大查詢天數）
+- `HOTMAP_INGEST_LOG_INTERVAL_SEC`（吞吐監控 log 週期）
+- `HOTMAP_HISTORY_BACKFILL_ON_STARTUP`（啟動時是否回補）
+- `HOTMAP_HISTORY_BACKFILL_DAYS`（回補天數）
+
+### 啟動清理（可選）
+
+- `HOTMAP_CLEANUP_ON_STARTUP`（是否在啟動時清理空快照）
+- `HOTMAP_CLEANUP_DAYS`（清理時間範圍，最近 N 天）
+
+---
+
+## 使用方式
+
+1. 建立環境檔：
+   - 將 `.env.example` 複製為 `.env`
+2. 填入必要設定（至少 `DISCORD_TOKEN`、`DATABASE_URL`）
+3. 建置並啟動：
    - `docker compose up --build -d`
-
-4. Wait for global command sync:
-
-   - Global slash commands can take some time to appear in Discord.
-
-5. Check logs:
-
+4. 觀察啟動與同步狀態：
    - `docker compose logs -f bot`
 
-## Example response
+---
 
-```text
-Here is @test_id in last 30 day(s) talking hotmap
-general  -------------------- 4.0k
-games    ------- 1.0k
-learning - 200
-image    - 200
-```
+## 權限與設定重點
 
-## Production scaling notes
+- Discord Developer Portal 需開啟：
+  - `MESSAGE CONTENT INTENT`
+  - （視需求）`SERVER MEMBERS INTENT`
+- 刪除紀錄頻道至少需：
+  - `View Channel`
+  - `Send Messages`
+  - `Embed Links`
+- 若需覆蓋 private thread 資料，bot 必須可加入並具備讀取歷史訊息權限。
 
-- Run one bot process first; add sharding when guild/message volume grows.
-- Add daily rollup table (materialized counts) if query cost rises.
-- Add data retention job (for example keep 90 days raw data).
-- Use managed PostgreSQL and monitor index size/IO.
-- Add rate-limit handling and retry policy for Discord API calls.
+---
 
-## Important Discord settings
+## 維運建議
 
-In Discord Developer Portal, enable intents used by this bot:
-
-- `SERVER MEMBERS INTENT`
-- `MESSAGE CONTENT INTENT`
-
-## Deleted message log feature
-
-- Use `/set_delete_log #channel` to configure a log channel.
-- Use `/delete_log_status` to verify channel config and bot permissions.
-- Supports both single delete and bulk delete events.
-- When a message is deleted, bot sends an embed containing:
-  - Original content
-  - User nickname and avatar
-  - Delete timestamp
-  - Attachment links (image/video/file)
-  - Sticker and custom emoji info
-
-### Required permissions for delete log channel
-
-The bot must have these permissions in the configured log channel:
-
-- `View Channel`
-- `Send Messages`
-- `Embed Links`
-
-Recommended:
-
-- `Read Message History`
-- `Attach Files`
-
-### Troubleshooting
-
-- Error: `Failed to send log message: 403 Forbidden (50013) Missing Permissions`
-  - Cause: Bot can read delete events but cannot send embed messages to the configured log channel.
-  - Fix:
-    1. Re-check channel override permissions for bot role/user.
-    2. Run `/delete_log_status` and ensure all required permissions pass.
-    3. Re-run `/set_delete_log #channel` after permission updates.
+- 生產環境建議固定保留最近一段時間資料（例如 30~90 天）
+- 大型社群請定期檢查：
+  - PostgreSQL 容量與索引膨脹
+  - 回補與清理任務耗時
+  - Bot 權限是否被頻道覆寫
