@@ -32,6 +32,27 @@ ADD COLUMN IF NOT EXISTS stickers_json TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE messages
 ADD COLUMN IF NOT EXISTS custom_emojis_json TEXT NOT NULL DEFAULT '[]';
 
+ALTER TABLE messages
+ADD COLUMN IF NOT EXISTS reference_message_id BIGINT;
+
+ALTER TABLE messages
+ADD COLUMN IF NOT EXISTS reference_channel_id BIGINT;
+
+ALTER TABLE messages
+ADD COLUMN IF NOT EXISTS reference_author_id BIGINT;
+
+ALTER TABLE messages
+ADD COLUMN IF NOT EXISTS reply_mention_enabled BOOLEAN;
+
+ALTER TABLE messages
+ADD COLUMN IF NOT EXISTS mentions_users_json TEXT NOT NULL DEFAULT '[]';
+
+ALTER TABLE messages
+ADD COLUMN IF NOT EXISTS mentions_roles_json TEXT NOT NULL DEFAULT '[]';
+
+ALTER TABLE messages
+ADD COLUMN IF NOT EXISTS mentions_everyone BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE INDEX IF NOT EXISTS idx_messages_author_time
 ON messages (author_id, created_at DESC);
 
@@ -82,6 +103,13 @@ class Database:
         attachments_json: str = "[]",
         stickers_json: str = "[]",
         custom_emojis_json: str = "[]",
+        reference_message_id: int | None = None,
+        reference_channel_id: int | None = None,
+        reference_author_id: int | None = None,
+        reply_mention_enabled: bool | None = None,
+        mentions_users_json: str = "[]",
+        mentions_roles_json: str = "[]",
+        mentions_everyone: bool = False,
     ) -> bool:
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=timezone.utc)
@@ -91,9 +119,11 @@ class Database:
         INSERT INTO messages (
             id, guild_id, channel_id, channel_name, author_id, created_at,
             content, author_display_name, author_avatar_url,
-            attachments_json, stickers_json, custom_emojis_json
+            attachments_json, stickers_json, custom_emojis_json,
+            reference_message_id, reference_channel_id, reference_author_id, reply_mention_enabled,
+            mentions_users_json, mentions_roles_json, mentions_everyone
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
         ON CONFLICT (id) DO UPDATE
         SET
             channel_name = EXCLUDED.channel_name,
@@ -120,7 +150,20 @@ class Database:
             custom_emojis_json = CASE
                 WHEN messages.custom_emojis_json = '[]' AND EXCLUDED.custom_emojis_json <> '[]' THEN EXCLUDED.custom_emojis_json
                 ELSE messages.custom_emojis_json
-            END
+            END,
+            reference_message_id = COALESCE(messages.reference_message_id, EXCLUDED.reference_message_id),
+            reference_channel_id = COALESCE(messages.reference_channel_id, EXCLUDED.reference_channel_id),
+            reference_author_id = COALESCE(messages.reference_author_id, EXCLUDED.reference_author_id),
+            reply_mention_enabled = COALESCE(messages.reply_mention_enabled, EXCLUDED.reply_mention_enabled),
+            mentions_users_json = CASE
+                WHEN messages.mentions_users_json = '[]' AND EXCLUDED.mentions_users_json <> '[]' THEN EXCLUDED.mentions_users_json
+                ELSE messages.mentions_users_json
+            END,
+            mentions_roles_json = CASE
+                WHEN messages.mentions_roles_json = '[]' AND EXCLUDED.mentions_roles_json <> '[]' THEN EXCLUDED.mentions_roles_json
+                ELSE messages.mentions_roles_json
+            END,
+            mentions_everyone = messages.mentions_everyone OR EXCLUDED.mentions_everyone
         RETURNING (xmax = 0) AS inserted;
         """
         async with self.pool.acquire() as conn:
@@ -138,6 +181,13 @@ class Database:
                 attachments_json,
                 stickers_json,
                 custom_emojis_json,
+                reference_message_id,
+                reference_channel_id,
+                reference_author_id,
+                reply_mention_enabled,
+                mentions_users_json,
+                mentions_roles_json,
+                mentions_everyone,
             )
             return bool(inserted)
 
@@ -378,7 +428,9 @@ class Database:
         SELECT
             id, guild_id, channel_id, channel_name, author_id, created_at,
             content, author_display_name, author_avatar_url,
-            attachments_json, stickers_json, custom_emojis_json
+            attachments_json, stickers_json, custom_emojis_json,
+            reference_message_id, reference_channel_id, reference_author_id, reply_mention_enabled,
+            mentions_users_json, mentions_roles_json, mentions_everyone
         FROM messages
         WHERE id = $1;
         """
@@ -394,7 +446,9 @@ class Database:
         SELECT
             id, guild_id, channel_id, channel_name, author_id, created_at,
             content, author_display_name, author_avatar_url,
-            attachments_json, stickers_json, custom_emojis_json
+            attachments_json, stickers_json, custom_emojis_json,
+            reference_message_id, reference_channel_id, reference_author_id, reply_mention_enabled,
+            mentions_users_json, mentions_roles_json, mentions_everyone
         FROM messages
         WHERE id = ANY($1::BIGINT[]);
         """

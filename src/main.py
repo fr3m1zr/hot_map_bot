@@ -753,6 +753,13 @@ class HotmapBot(discord.Client):
             attachments_json=json.dumps(snapshot["attachments"], ensure_ascii=False),
             stickers_json=json.dumps(snapshot["stickers"], ensure_ascii=False),
             custom_emojis_json=json.dumps(snapshot["custom_emojis"], ensure_ascii=False),
+            reference_message_id=snapshot["reference_message_id"],
+            reference_channel_id=snapshot["reference_channel_id"],
+            reference_author_id=snapshot["reference_author_id"],
+            reply_mention_enabled=snapshot["reply_mention_enabled"],
+            mentions_users_json=json.dumps(snapshot["mentions_users"], ensure_ascii=False),
+            mentions_roles_json=json.dumps(snapshot["mentions_roles"], ensure_ascii=False),
+            mentions_everyone=bool(snapshot["mentions_everyone"]),
         )
         if inserted:
             self.total_ingested_messages += 1
@@ -916,6 +923,33 @@ class HotmapBot(discord.Client):
         if message.author.display_avatar is not None:
             avatar_url = str(message.author.display_avatar.url)
 
+        mentions_users = [member.id for member in message.mentions]
+        mentions_roles = [role.id for role in message.role_mentions]
+        mentions_everyone = bool(message.mention_everyone)
+
+        reference_message_id: int | None = None
+        reference_channel_id: int | None = None
+        reference_author_id: int | None = None
+        reply_mention_enabled: bool | None = None
+
+        reference = message.reference
+        if reference is not None and reference.message_id is not None:
+            reference_message_id = int(reference.message_id)
+            if reference.channel_id is not None:
+                reference_channel_id = int(reference.channel_id)
+            else:
+                reference_channel_id = getattr(message.channel, "id", None)
+
+            resolved = getattr(reference, "resolved", None)
+            if isinstance(resolved, discord.Message):
+                reference_author_id = resolved.author.id
+            cached_reference = getattr(reference, "cached_message", None)
+            if reference_author_id is None and isinstance(cached_reference, discord.Message):
+                reference_author_id = cached_reference.author.id
+            if reference_author_id is not None:
+                # `message.mentions` reflects actual mention targets better than raw text parsing.
+                reply_mention_enabled = reference_author_id in mentions_users
+
         return {
             "content": content,
             "author_display_name": author_display_name,
@@ -923,6 +957,13 @@ class HotmapBot(discord.Client):
             "attachments": attachments,
             "stickers": stickers,
             "custom_emojis": custom_emojis,
+            "reference_message_id": reference_message_id,
+            "reference_channel_id": reference_channel_id,
+            "reference_author_id": reference_author_id,
+            "reply_mention_enabled": reply_mention_enabled,
+            "mentions_users": mentions_users,
+            "mentions_roles": mentions_roles,
+            "mentions_everyone": mentions_everyone,
         }
 
     def _build_sticker_asset_urls(self, sticker_id: int, format_name: str) -> Dict[str, str]:
@@ -955,6 +996,36 @@ class HotmapBot(discord.Client):
             except json.JSONDecodeError:
                 return []
 
+        def parse_json_int_list(raw: Any) -> List[int]:
+            parsed = parse_json_list(raw)
+            numbers: List[int] = []
+            for item in parsed:
+                try:
+                    numbers.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+            return numbers
+
+        def parse_optional_int(raw: Any) -> int | None:
+            if raw is None:
+                return None
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return None
+
+        def parse_optional_bool(raw: Any) -> bool | None:
+            if raw is None:
+                return None
+            if isinstance(raw, bool):
+                return raw
+            text = to_text(raw).strip().lower()
+            if text in {"1", "true", "t", "yes", "y", "on"}:
+                return True
+            if text in {"0", "false", "f", "no", "n", "off"}:
+                return False
+            return None
+
         return {
             "message_id": int(row.get("id", 0)),
             "guild_id": int(row.get("guild_id", 0)),
@@ -968,6 +1039,13 @@ class HotmapBot(discord.Client):
             "attachments": parse_json_list(row.get("attachments_json")),
             "stickers": parse_json_list(row.get("stickers_json")),
             "custom_emojis": parse_json_list(row.get("custom_emojis_json")),
+            "reference_message_id": parse_optional_int(row.get("reference_message_id")),
+            "reference_channel_id": parse_optional_int(row.get("reference_channel_id")),
+            "reference_author_id": parse_optional_int(row.get("reference_author_id")),
+            "reply_mention_enabled": parse_optional_bool(row.get("reply_mention_enabled")),
+            "mentions_users": parse_json_int_list(row.get("mentions_users_json")),
+            "mentions_roles": parse_json_int_list(row.get("mentions_roles_json")),
+            "mentions_everyone": bool(row.get("mentions_everyone", False)),
         }
 
     async def close(self) -> None:
@@ -1033,6 +1111,13 @@ class HotmapBot(discord.Client):
         attachments = snapshot.get("attachments", []) if snapshot else []
         stickers = snapshot.get("stickers", []) if snapshot else []
         custom_emojis = snapshot.get("custom_emojis", []) if snapshot else []
+        reference_message_id = int(snapshot.get("reference_message_id") or 0) if snapshot else 0
+        reference_channel_id = int(snapshot.get("reference_channel_id") or 0) if snapshot else 0
+        reference_author_id = int(snapshot.get("reference_author_id") or 0) if snapshot else 0
+        reply_mention_enabled = snapshot.get("reply_mention_enabled") if snapshot else None
+        mentions_users = snapshot.get("mentions_users", []) if snapshot else []
+        mentions_roles = snapshot.get("mentions_roles", []) if snapshot else []
+        mentions_everyone = bool(snapshot.get("mentions_everyone", False)) if snapshot else False
 
         if snapshot is None:
             print(
@@ -1064,33 +1149,23 @@ class HotmapBot(discord.Client):
         if not author_display_name:
             author_display_name = f"user-{author_id}" if author_id else "未知使用者"
 
+        title = "訊息刪除紀錄"
         embed = discord.Embed(
-            title="訊息刪除紀錄",
+            title=title,
             color=discord.Color.red(),
-            timestamp=deleted_at,
         )
         embed.set_author(
             name=author_display_name,
             icon_url=author_avatar_url if author_avatar_url else None,
         )
 
-        if author_id:
-            embed.add_field(name="使用者", value=f"<@{author_id}>", inline=True)
+        channel_name = to_text(snapshot.get("channel_name")) if snapshot else ""
+        if not channel_name and channel_id:
+            channel_name = f"<#{channel_id}>"
         if channel_id:
-            embed.add_field(name="原頻道", value=f"<#{channel_id}>", inline=True)
-        embed.add_field(
-            name="刪除時間",
-            value=f"<t:{int(deleted_at.timestamp())}:F>",
-            inline=True,
-        )
-        if isinstance(created_at, datetime):
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-            embed.add_field(
-                name="原訊息時間",
-                value=f"<t:{int(created_at.timestamp())}:F>",
-                inline=True,
-            )
+            embed.add_field(name="頻道", value=f"<#{channel_id}>", inline=False)
+        elif channel_name:
+            embed.add_field(name="頻道", value=channel_name, inline=False)
 
         embed.add_field(
             name="訊息內容",
@@ -1101,6 +1176,65 @@ class HotmapBot(discord.Client):
                 if not attachments and not stickers and not custom_emojis
                 else "(無文字內容)"
             ),
+            inline=False,
+        )
+
+        if reference_message_id:
+            if reply_mention_enabled is None and reference_author_id:
+                reply_mention_enabled = reference_author_id in mentions_users
+
+            if reply_mention_enabled is True:
+                reply_mention_text = "開啟"
+            elif reply_mention_enabled is False:
+                reply_mention_text = "關閉"
+            else:
+                reply_mention_text = "未知（無法判定）"
+            referenced_preview = "(無法取得，可能未留存或已刪除)"
+            reference_snapshot = await self.db.get_message_snapshot(reference_message_id)
+            if reference_snapshot is not None:
+                reference_data = self._build_snapshot_from_db_row(reference_snapshot)
+                if not reference_author_id:
+                    reference_author_id = int(reference_data.get("author_id", 0))
+                referenced_content = to_text(reference_data.get("content")).strip()
+                reference_attachments = reference_data.get("attachments", [])
+                reference_stickers = reference_data.get("stickers", [])
+                reference_custom_emojis = reference_data.get("custom_emojis", [])
+                if referenced_content:
+                    referenced_preview = truncate_text(referenced_content, 240)
+                elif reference_attachments or reference_stickers or reference_custom_emojis:
+                    referenced_preview = "(無文字內容，含附件/貼圖/表情)"
+                else:
+                    referenced_preview = "(無文字內容)"
+
+            reply_info_lines = []
+            if reference_author_id:
+                reply_info_lines.append(f"回覆對象: <@{reference_author_id}>")
+            else:
+                reply_info_lines.append("回覆對象: (未知)")
+            reply_info_lines.append(f"回覆 mention: {reply_mention_text}")
+            reply_channel_id = reference_channel_id or channel_id
+            if reply_channel_id:
+                reply_jump_url = (
+                    f"https://discord.com/channels/{guild_id}/{reply_channel_id}/{reference_message_id}"
+                )
+                reply_info_lines.append(f"[原始訊息連結]({reply_jump_url})")
+            embed.add_field(name="回覆資訊", value=truncate_text("\n".join(reply_info_lines), 1000), inline=False)
+
+            quoted_reply_preview = "\n".join(f"> {line}" for line in referenced_preview.splitlines()) or "> (無文字內容)"
+            embed.add_field(
+                name="回覆訊息",
+                value=truncate_text(quoted_reply_preview, 1000),
+                inline=False,
+            )
+
+        time_lines = [f"刪除：<t:{int(deleted_at.timestamp())}:f>"]
+        if isinstance(created_at, datetime):
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            time_lines.append(f"原訊息：<t:{int(created_at.timestamp())}:f>")
+        embed.add_field(
+            name="時間",
+            value="\n".join(time_lines),
             inline=False,
         )
 
@@ -1458,6 +1592,13 @@ class HotmapBot(discord.Client):
                     attachments_json=json.dumps(snapshot["attachments"], ensure_ascii=False),
                     stickers_json=json.dumps(snapshot["stickers"], ensure_ascii=False),
                     custom_emojis_json=json.dumps(snapshot["custom_emojis"], ensure_ascii=False),
+                    reference_message_id=snapshot["reference_message_id"],
+                    reference_channel_id=snapshot["reference_channel_id"],
+                    reference_author_id=snapshot["reference_author_id"],
+                    reply_mention_enabled=snapshot["reply_mention_enabled"],
+                    mentions_users_json=json.dumps(snapshot["mentions_users"], ensure_ascii=False),
+                    mentions_roles_json=json.dumps(snapshot["mentions_roles"], ensure_ascii=False),
+                    mentions_everyone=bool(snapshot["mentions_everyone"]),
                 )
                 if ok:
                     inserted += 1
@@ -1949,6 +2090,12 @@ def build_message_inspect_command(bot: HotmapBot) -> app_commands.Command:
             f"- attachments: {len(db_attachments)}",
             f"- stickers: {len(db_stickers)}",
             f"- custom_emojis: {len(snapshot.get('custom_emojis', []))}",
+            f"- reference_message_id: {snapshot.get('reference_message_id')}",
+            f"- reference_author_id: {snapshot.get('reference_author_id')}",
+            f"- reply_mention_enabled: {snapshot.get('reply_mention_enabled')}",
+            f"- mentions_users: {len(snapshot.get('mentions_users', []))}",
+            f"- mentions_roles: {len(snapshot.get('mentions_roles', []))}",
+            f"- mentions_everyone: {snapshot.get('mentions_everyone')}",
             f"- 分類推論: {db_reason}",
         ]
 
