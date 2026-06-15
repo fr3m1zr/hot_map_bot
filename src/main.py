@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import asyncio
 import json
+import random
 from io import BytesIO
 import re
 import traceback
@@ -45,6 +46,32 @@ OTHER_REASON_INACCESSIBLE = "無法存取的訊息（可能已刪除）"
 OTHER_REASON_ACCESSIBLE_EMPTY = "可存取但空內容（系統/特殊訊息）"
 OTHER_REASON_EMPTY_WITH_STRUCTURED_DATA = "內容為空（但存在結構資料）"
 OTHER_REASON_UNRECOGNIZED = "未識別格式"
+
+TABETAI_RECENT_MEAL_COUNT = 4
+TABETAI_ANIMATION_STEPS = 8
+TABETAI_ANIMATION_DELAY_SEC = 0.20
+TABETAI_FOODS = [
+    "牛肉麵",
+    "滷肉飯",
+    "咖哩飯",
+    "便當",
+    "水餃",
+    "鍋貼",
+    "拉麵",
+    "義大利麵",
+    "披薩",
+    "漢堡",
+    "炒飯",
+    "炒麵",
+    "壽司",
+    "韓式拌飯",
+    "火鍋",
+    "燒肉飯",
+    "鹹酥雞",
+    "三明治",
+    "粥",
+    "沙拉",
+]
 
 
 def format_count(n: int) -> str:
@@ -118,6 +145,65 @@ def classify_other_reason(content: str, attachments_json: str, stickers_json: st
             return OTHER_REASON_EMPTY_PENDING
         return OTHER_REASON_EMPTY_WITH_STRUCTURED_DATA
     return OTHER_REASON_UNRECOGNIZED
+
+
+def pick_tabetai_choice(
+    candidates: List[str],
+    recent_meals: List[str],
+    excluded_meals: Set[str],
+) -> Tuple[str | None, bool]:
+    if not candidates:
+        return None, False
+
+    recent_set = {item for item in recent_meals if item}
+    excluded_set = {item for item in excluded_meals if item}
+
+    strict_pool = [item for item in candidates if item not in recent_set and item not in excluded_set]
+    if strict_pool:
+        return random.choice(strict_pool), False
+
+    relaxed_pool = [item for item in candidates if item not in excluded_set]
+    if relaxed_pool:
+        return random.choice(relaxed_pool), True
+
+    cooldown_only_pool = [item for item in candidates if item not in recent_set]
+    if cooldown_only_pool:
+        return random.choice(cooldown_only_pool), True
+
+    return random.choice(candidates), True
+
+
+def build_tabetai_animation_embed(
+    candidates: List[str],
+    step: int,
+    total_steps: int,
+    redraw: bool = False,
+) -> discord.Embed:
+    if not candidates:
+        candidates = ["---"]
+
+    if len(candidates) >= 3:
+        lane_items = random.sample(candidates, 3)
+    else:
+        lane_items = [random.choice(candidates) for _ in range(3)]
+    left, center, right = lane_items
+
+    progress_slots = 10
+    filled = max(1, int((step / max(1, total_steps)) * progress_slots))
+    progress_bar = ("▰" * filled) + ("▱" * (progress_slots - filled))
+    phase_text = "重抽中" if redraw else "抽選中"
+    dice_icon = random.choice(["🎲", "🎯", "🍽️"])
+
+    embed = discord.Embed(
+        title=f"食べたい {phase_text}...",
+        color=discord.Color.blurple(),
+    )
+    embed.description = (
+        f"{dice_icon} 抽到候選：**{center}**\n"
+        f"`{left}`  ⇢  **{center}**  ⇢  `{right}`\n"
+        f"{progress_bar}  {step}/{total_steps}"
+    )
+    return embed
 
 
 def aggregate_hotmap_rows(rows: List[Tuple[str, int]]) -> Tuple[List[Tuple[str, int]], int]:
@@ -712,6 +798,7 @@ class HotmapBot(discord.Client):
         self.history_backfill_days = max(1, min(180, int(self.settings.history_backfill_days)))
         self.cleanup_on_startup = bool(self.settings.cleanup_on_startup)
         self.cleanup_days = max(1, min(180, int(self.settings.cleanup_days)))
+        self.active_tabetai_sessions: Set[Tuple[int, int]] = set()
 
     async def setup_hook(self) -> None:
         print("Starting global slash command sync...")
@@ -1663,6 +1750,822 @@ class HotmapBot(discord.Client):
             return "failed"
 
 
+class TabetaiDrawView(discord.ui.View):
+    def __init__(
+        self,
+        bot: HotmapBot,
+        guild_id: int,
+        user_id: int,
+        candidates: List[str],
+        recent_meals: List[str],
+        initial_choice: str,
+        relaxed_rule: bool,
+    ) -> None:
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.candidates = list(candidates)
+        self.recent_meals = list(recent_meals)
+        self.current_choice = initial_choice
+        self.relaxed_rule = relaxed_rule
+        self.excluded_meals: Set[str] = set()
+        self.message: discord.Message | None = None
+        self.is_rolling = False
+
+    def _session_key(self) -> Tuple[int, int]:
+        return (self.guild_id, self.user_id)
+
+    def _release_session(self) -> None:
+        self.bot.active_tabetai_sessions.discard(self._session_key())
+
+    def _build_result_embed(self, confirmed: bool = False) -> discord.Embed:
+        embed = discord.Embed(
+            title="食べたい抽選",
+            color=discord.Color.orange() if not confirmed else discord.Color.green(),
+        )
+        embed.add_field(
+            name="🎯 抽選結果",
+            value=f"```text\n{self.current_choice}\n```",
+            inline=False,
+        )
+        embed.add_field(
+            name="使用者",
+            value=f"<@{self.user_id}>",
+            inline=False,
+        )
+
+        if self.recent_meals:
+            embed.add_field(
+                name=f"最近 {TABETAI_RECENT_MEAL_COUNT} 餐",
+                value="、".join(self.recent_meals[:TABETAI_RECENT_MEAL_COUNT]),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name=f"最近 {TABETAI_RECENT_MEAL_COUNT} 餐",
+                value="（尚無紀錄）",
+                inline=False,
+            )
+
+        if confirmed:
+            embed.add_field(name="狀態", value="✅ 選好了 趕快去吃！", inline=False)
+        else:
+            status = "❗ 本輪可選項不足，已暫時放寬不重複限制。" if self.relaxed_rule else "請按 ✅ 確認，或按 ❌ 重抽。"
+            embed.add_field(name="狀態", value=status, inline=False)
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "只有發起抽籤的人可以操作這個按鈕。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        self._release_session()
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="✅ 確認", style=discord.ButtonStyle.success)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.bot.db.insert_meal_selection(
+            guild_id=self.guild_id,
+            user_id=self.user_id,
+            meal_name=self.current_choice,
+        )
+        self._release_session()
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        await interaction.response.edit_message(
+            embed=self._build_result_embed(confirmed=True),
+            view=self,
+        )
+
+    @discord.ui.button(label="❌ 重抽", style=discord.ButtonStyle.danger)
+    async def redraw_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.is_rolling:
+            await interaction.response.send_message(
+                "正在抽選中，請稍候。",
+                ephemeral=True,
+            )
+            return
+
+        self.excluded_meals.add(self.current_choice)
+        next_choice, relaxed_rule = pick_tabetai_choice(
+            candidates=self.candidates,
+            recent_meals=self.recent_meals,
+            excluded_meals=self.excluded_meals,
+        )
+        if not next_choice:
+            await interaction.response.send_message(
+                "目前沒有可抽取的品項，請稍後再試。",
+                ephemeral=True,
+            )
+            return
+
+        self.is_rolling = True
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+
+        target_message = self.message or interaction.message
+        if target_message is None:
+            self.is_rolling = False
+            for item in self.children:
+                if isinstance(item, discord.ui.Button):
+                    item.disabled = False
+            await interaction.response.send_message(
+                "抽選面板狀態異常，請重新輸入 /tabetai。",
+                ephemeral=True,
+            )
+            return
+        self.message = target_message
+
+        redraw_success = False
+        redraw_error: Exception | None = None
+        try:
+            first_frame = build_tabetai_animation_embed(
+                candidates=self.candidates,
+                step=1,
+                total_steps=TABETAI_ANIMATION_STEPS,
+                redraw=True,
+            )
+            await interaction.response.edit_message(embed=first_frame, view=self)
+
+            for step in range(2, TABETAI_ANIMATION_STEPS + 1):
+                await asyncio.sleep(TABETAI_ANIMATION_DELAY_SEC)
+                frame_embed = build_tabetai_animation_embed(
+                    candidates=self.candidates,
+                    step=step,
+                    total_steps=TABETAI_ANIMATION_STEPS,
+                    redraw=True,
+                )
+                await target_message.edit(embed=frame_embed, view=self)
+
+            self.current_choice = next_choice
+            self.relaxed_rule = relaxed_rule
+            redraw_success = True
+        except Exception as exc:
+            redraw_error = exc
+        finally:
+            self.is_rolling = False
+
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = False
+
+        if redraw_success:
+            await target_message.edit(
+                embed=self._build_result_embed(confirmed=False),
+                view=self,
+            )
+            return
+
+        try:
+            await target_message.edit(view=self)
+        except discord.HTTPException:
+            pass
+        if redraw_error is not None:
+            print(f"[Tabetai] redraw animation failed: {redraw_error}")
+        await interaction.followup.send(
+            "重抽動畫發生問題，按鈕已恢復，請再試一次。",
+            ephemeral=True,
+        )
+
+
+class TabetaiRemoveView(discord.ui.View):
+    def __init__(
+        self,
+        bot: HotmapBot,
+        guild_id: int,
+        user_id: int,
+        meal_options: List[str],
+    ) -> None:
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.meal_options = list(meal_options)
+        self.page_index = 0
+        self.page_size = 25
+        self.message: discord.Message | None = None
+        self._refresh_components()
+
+    def _max_page_index(self) -> int:
+        if not self.meal_options:
+            return 0
+        return (len(self.meal_options) - 1) // self.page_size
+
+    def _current_page_items(self) -> List[str]:
+        start = self.page_index * self.page_size
+        end = start + self.page_size
+        return self.meal_options[start:end]
+
+    def _refresh_components(self) -> None:
+        self.clear_items()
+
+        page_items = self._current_page_items()
+        if page_items:
+            options = [
+                discord.SelectOption(
+                    label=truncate_text(item, 100),
+                    value=item,
+                )
+                for item in page_items
+            ]
+            select = discord.ui.Select(
+                placeholder="選擇要移除的餐點",
+                min_values=1,
+                max_values=1,
+                options=options,
+            )
+
+            async def on_select(interaction: discord.Interaction) -> None:
+                selected_name = select.values[0]
+                removed = await self.bot.db.remove_meal_option(self.guild_id, selected_name)
+                self.meal_options = await self.bot.db.get_meal_options(self.guild_id)
+                self.page_index = min(self.page_index, self._max_page_index())
+                self._refresh_components()
+
+                if removed:
+                    message = f"已移除餐點：`{selected_name}`"
+                else:
+                    message = f"移除失敗或項目不存在：`{selected_name}`"
+
+                await interaction.response.edit_message(
+                    embed=self.build_embed(message),
+                    view=self,
+                )
+
+            select.callback = on_select
+            self.add_item(select)
+
+        prev_button = discord.ui.Button(
+            label="⬅️ 上一頁",
+            style=discord.ButtonStyle.secondary,
+            disabled=not self.meal_options or self.page_index <= 0,
+        )
+
+        async def on_prev(interaction: discord.Interaction) -> None:
+            self.page_index = max(0, self.page_index - 1)
+            self._refresh_components()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+        prev_button.callback = on_prev
+        self.add_item(prev_button)
+
+        next_button = discord.ui.Button(
+            label="下一頁 ➡️",
+            style=discord.ButtonStyle.secondary,
+            disabled=not self.meal_options or self.page_index >= self._max_page_index(),
+        )
+
+        async def on_next(interaction: discord.Interaction) -> None:
+            self.page_index = min(self._max_page_index(), self.page_index + 1)
+            self._refresh_components()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+        next_button.callback = on_next
+        self.add_item(next_button)
+
+        close_button = discord.ui.Button(
+            label="完成",
+            style=discord.ButtonStyle.success,
+        )
+
+        async def on_close(interaction: discord.Interaction) -> None:
+            self.stop()
+            for item in self.children:
+                if isinstance(item, (discord.ui.Button, discord.ui.Select)):
+                    item.disabled = True
+            await interaction.response.edit_message(embed=self.build_embed("已關閉移除面板。"), view=self)
+
+        close_button.callback = on_close
+        self.add_item(close_button)
+
+    def build_embed(self, status_message: str = "請從下拉選單選擇要移除的餐點。") -> discord.Embed:
+        embed = discord.Embed(
+            title="tabetai 餐點清單移除",
+            color=discord.Color.orange(),
+            description=status_message,
+        )
+        total = len(self.meal_options)
+        if total == 0:
+            embed.add_field(name="目前清單", value="（無資料）", inline=False)
+            embed.add_field(name="提示", value="下一次使用 /tabetai 會自動載入完整預設清單。", inline=False)
+            return embed
+
+        page_items = self._current_page_items()
+        page_text = "\n".join(f"- {item}" for item in page_items) or "（無資料）"
+        embed.add_field(name="本頁餐點", value=truncate_text(page_text, 1000), inline=False)
+        embed.add_field(
+            name="頁面",
+            value=f"{self.page_index + 1}/{self._max_page_index() + 1}（共 {total} 項）",
+            inline=False,
+        )
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "只有發起指令的人可以操作這個面板。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if isinstance(item, (discord.ui.Button, discord.ui.Select)):
+                item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+class TabetaiHistoryClearView(discord.ui.View):
+    def __init__(
+        self,
+        bot: HotmapBot,
+        guild_id: int,
+        user_id: int,
+        entries: List[Tuple[int, str, datetime]],
+    ) -> None:
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.entries = list(entries)
+        self.page_index = 0
+        self.page_size = 25
+        self.message: discord.Message | None = None
+        self._refresh_components()
+
+    def _max_page_index(self) -> int:
+        if not self.entries:
+            return 0
+        return (len(self.entries) - 1) // self.page_size
+
+    def _current_page_entries(self) -> List[Tuple[int, str, datetime]]:
+        start = self.page_index * self.page_size
+        end = start + self.page_size
+        return self.entries[start:end]
+
+    def _format_time_text(self, selected_at: datetime) -> str:
+        value = selected_at
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.strftime("%Y-%m-%d %H:%M UTC")
+
+    def _refresh_components(self) -> None:
+        self.clear_items()
+
+        page_entries = self._current_page_entries()
+        if page_entries:
+            options = []
+            for entry_id, meal_name, selected_at in page_entries:
+                options.append(
+                    discord.SelectOption(
+                        label=truncate_text(meal_name, 100),
+                        value=str(entry_id),
+                        description=truncate_text(self._format_time_text(selected_at), 100),
+                    )
+                )
+            select = discord.ui.Select(
+                placeholder="選擇要清除的抽選紀錄",
+                min_values=1,
+                max_values=1,
+                options=options,
+            )
+
+            async def on_select(interaction: discord.Interaction) -> None:
+                selected_entry_id = int(select.values[0])
+                removed = await self.bot.db.delete_meal_history_entry(
+                    guild_id=self.guild_id,
+                    user_id=self.user_id,
+                    entry_id=selected_entry_id,
+                )
+                self.entries = await self.bot.db.get_meal_history_entries(
+                    guild_id=self.guild_id,
+                    user_id=self.user_id,
+                    limit=100,
+                )
+                self.page_index = min(self.page_index, self._max_page_index())
+                self._refresh_components()
+
+                if removed:
+                    status = f"已刪除抽選紀錄（id={selected_entry_id}）。"
+                else:
+                    status = f"刪除失敗或紀錄不存在（id={selected_entry_id}）。"
+                await interaction.response.edit_message(
+                    embed=self.build_embed(status),
+                    view=self,
+                )
+
+            select.callback = on_select
+            self.add_item(select)
+
+        prev_button = discord.ui.Button(
+            label="⬅️ 上一頁",
+            style=discord.ButtonStyle.secondary,
+            disabled=not self.entries or self.page_index <= 0,
+        )
+
+        async def on_prev(interaction: discord.Interaction) -> None:
+            self.page_index = max(0, self.page_index - 1)
+            self._refresh_components()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+        prev_button.callback = on_prev
+        self.add_item(prev_button)
+
+        next_button = discord.ui.Button(
+            label="下一頁 ➡️",
+            style=discord.ButtonStyle.secondary,
+            disabled=not self.entries or self.page_index >= self._max_page_index(),
+        )
+
+        async def on_next(interaction: discord.Interaction) -> None:
+            self.page_index = min(self._max_page_index(), self.page_index + 1)
+            self._refresh_components()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+        next_button.callback = on_next
+        self.add_item(next_button)
+
+        close_button = discord.ui.Button(
+            label="完成",
+            style=discord.ButtonStyle.success,
+        )
+
+        async def on_close(interaction: discord.Interaction) -> None:
+            self.stop()
+            for item in self.children:
+                if isinstance(item, (discord.ui.Button, discord.ui.Select)):
+                    item.disabled = True
+            await interaction.response.edit_message(
+                embed=self.build_embed("已關閉紀錄清除面板。"),
+                view=self,
+            )
+
+        close_button.callback = on_close
+        self.add_item(close_button)
+
+    def build_embed(self, status_message: str = "請從下拉選單選擇要清除的紀錄。") -> discord.Embed:
+        embed = discord.Embed(
+            title="食べたい抽選紀錄清除",
+            color=discord.Color.orange(),
+            description=status_message,
+        )
+        if not self.entries:
+            embed.add_field(name="目前紀錄", value="（無資料）", inline=False)
+            return embed
+
+        page_entries = self._current_page_entries()
+        lines: List[str] = []
+        for entry_id, meal_name, selected_at in page_entries:
+            ts = selected_at
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            lines.append(f"- {meal_name} · <t:{int(ts.timestamp())}:f> (`{entry_id}`)")
+        embed.add_field(name="本頁紀錄", value=truncate_text("\n".join(lines), 1000), inline=False)
+        embed.add_field(
+            name="頁面",
+            value=f"{self.page_index + 1}/{self._max_page_index() + 1}（共 {len(self.entries)} 筆）",
+            inline=False,
+        )
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "只有發起指令的人可以操作這個面板。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if isinstance(item, (discord.ui.Button, discord.ui.Select)):
+                item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+def build_tabetai_command(bot: HotmapBot) -> app_commands.Command:
+    @app_commands.command(
+        name="tabetai",
+        description="Draw a meal suggestion with confirm/redraw buttons.",
+    )
+    @app_commands.guild_only()
+    async def tabetai(interaction: discord.Interaction) -> None:
+        guild_id = interaction.guild_id
+        guild = interaction.guild
+        if guild_id is None or guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        user_id = interaction.user.id
+        session_key = (guild_id, user_id)
+        if session_key in bot.active_tabetai_sessions:
+            await interaction.response.send_message(
+                "你已經有一個進行中的抽籤，請先完成目前這輪。",
+                ephemeral=True,
+            )
+            return
+
+        bot.active_tabetai_sessions.add(session_key)
+
+        try:
+            candidates = await bot.db.ensure_meal_options(guild_id, TABETAI_FOODS)
+            recent_meals = await bot.db.get_recent_meal_selections(
+                guild_id=guild_id,
+                user_id=user_id,
+                limit=TABETAI_RECENT_MEAL_COUNT,
+            )
+
+            choice, relaxed_rule = pick_tabetai_choice(
+                candidates=candidates,
+                recent_meals=recent_meals,
+                excluded_meals=set(),
+            )
+            if not choice:
+                bot.active_tabetai_sessions.discard(session_key)
+                await interaction.response.send_message(
+                    "目前沒有可抽取的品項，請先補上品項設定。",
+                    ephemeral=True,
+                )
+                return
+
+            rolling_embed = build_tabetai_animation_embed(
+                candidates=candidates,
+                step=1,
+                total_steps=TABETAI_ANIMATION_STEPS,
+                redraw=False,
+            )
+            await interaction.response.send_message(embed=rolling_embed)
+            message = await interaction.original_response()
+
+            for step in range(2, TABETAI_ANIMATION_STEPS + 1):
+                await asyncio.sleep(TABETAI_ANIMATION_DELAY_SEC)
+                rolling_embed = build_tabetai_animation_embed(
+                    candidates=candidates,
+                    step=step,
+                    total_steps=TABETAI_ANIMATION_STEPS,
+                    redraw=False,
+                )
+                await message.edit(embed=rolling_embed, view=None)
+            if TABETAI_ANIMATION_STEPS == 1:
+                await message.edit(embed=rolling_embed, view=None)
+
+            if TABETAI_ANIMATION_STEPS > 1:
+                await asyncio.sleep(TABETAI_ANIMATION_DELAY_SEC)
+
+            view = TabetaiDrawView(
+                bot=bot,
+                guild_id=guild_id,
+                user_id=user_id,
+                candidates=candidates,
+                recent_meals=recent_meals,
+                initial_choice=choice,
+                relaxed_rule=relaxed_rule,
+            )
+            view.message = message
+            await message.edit(embed=view._build_result_embed(confirmed=False), view=view)
+        except Exception:
+            bot.active_tabetai_sessions.discard(session_key)
+            raise
+
+    return tabetai
+
+
+def build_tabetai_clear_command(bot: HotmapBot) -> app_commands.Command:
+    @app_commands.command(
+        name="tabetai_clear",
+        description="Remove selected tabetai history entries.",
+    )
+    @app_commands.guild_only()
+    async def tabetai_clear(interaction: discord.Interaction) -> None:
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        user_id = interaction.user.id
+        entries = await bot.db.get_meal_history_entries(
+            guild_id=guild_id,
+            user_id=user_id,
+            limit=100,
+        )
+        if not entries:
+            await interaction.response.send_message(
+                "你目前沒有抽選紀錄可清除。",
+                ephemeral=True,
+            )
+            return
+
+        view = TabetaiHistoryClearView(
+            bot=bot,
+            guild_id=guild_id,
+            user_id=user_id,
+            entries=entries,
+        )
+        await interaction.response.send_message(
+            embed=view.build_embed(),
+            view=view,
+            ephemeral=True,
+        )
+        view.message = await interaction.original_response()
+
+    return tabetai_clear
+
+
+def build_tabetai_add_command(bot: HotmapBot) -> app_commands.Command:
+    @app_commands.command(
+        name="tabetai_add",
+        description="Add one meal option to tabetai list.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(meal_name="Meal name to add")
+    async def tabetai_add(
+        interaction: discord.Interaction,
+        meal_name: app_commands.Range[str, 1, 60],
+    ) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You need server administrator permission to use this command.",
+                ephemeral=True,
+            )
+            return
+
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        normalized_name = meal_name.strip()
+        if not normalized_name:
+            await interaction.response.send_message(
+                "meal_name cannot be empty.",
+                ephemeral=True,
+            )
+            return
+
+        existing_options = await bot.db.ensure_meal_options(guild_id, TABETAI_FOODS)
+        normalized_key = normalized_name.casefold()
+        for option in existing_options:
+            if option.strip().casefold() == normalized_key:
+                await interaction.response.send_message(
+                    f"餐點已存在：`{option}`",
+                    ephemeral=True,
+                )
+                return
+
+        inserted = await bot.db.add_meal_option(guild_id, normalized_name)
+        current_options = await bot.db.get_meal_options(guild_id)
+        if inserted:
+            await interaction.response.send_message(
+                f"已新增餐點：`{normalized_name}`\n目前清單共 {len(current_options)} 項。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"餐點已存在：`{normalized_name}`",
+            ephemeral=True,
+        )
+
+    return tabetai_add
+
+
+def build_tabetai_remove_command(bot: HotmapBot) -> app_commands.Command:
+    @app_commands.command(
+        name="tabetai_remove",
+        description="Remove meal options (by name or interactive picker).",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(meal_name="Meal name to remove (optional)")
+    async def tabetai_remove(
+        interaction: discord.Interaction,
+        meal_name: app_commands.Range[str, 1, 60] | None = None,
+    ) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You need server administrator permission to use this command.",
+                ephemeral=True,
+            )
+            return
+
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        options = await bot.db.ensure_meal_options(guild_id, TABETAI_FOODS)
+        if not options:
+            await interaction.response.send_message(
+                "目前沒有可移除的餐點。",
+                ephemeral=True,
+            )
+            return
+
+        if meal_name is None:
+            view = TabetaiRemoveView(
+                bot=bot,
+                guild_id=guild_id,
+                user_id=interaction.user.id,
+                meal_options=options,
+            )
+            await interaction.response.send_message(
+                embed=view.build_embed(),
+                view=view,
+                ephemeral=True,
+            )
+            view.message = await interaction.original_response()
+            return
+
+        requested_name = meal_name.strip()
+        if not requested_name:
+            await interaction.response.send_message(
+                "meal_name cannot be empty.",
+                ephemeral=True,
+            )
+            return
+
+        target_name = ""
+        for option in options:
+            if option == requested_name:
+                target_name = option
+                break
+        if not target_name:
+            lowered = requested_name.lower()
+            for option in options:
+                if option.lower() == lowered:
+                    target_name = option
+                    break
+        if not target_name:
+            await interaction.response.send_message(
+                f"找不到餐點：`{requested_name}`\n可改用 `/tabetai_remove` 不帶參數，用選單操作。",
+                ephemeral=True,
+            )
+            return
+
+        removed = await bot.db.remove_meal_option(guild_id, target_name)
+        if not removed:
+            await interaction.response.send_message(
+                f"移除失敗：`{target_name}`",
+                ephemeral=True,
+            )
+            return
+
+        current_options = await bot.db.get_meal_options(guild_id)
+        if current_options:
+            await interaction.response.send_message(
+                f"已移除餐點：`{target_name}`\n目前清單共 {len(current_options)} 項。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "目前清單已清空，下一次 `/tabetai` 會自動載入完整預設清單。",
+            ephemeral=True,
+        )
+
+    return tabetai_remove
+
+
 def build_hotmap_command(bot: HotmapBot) -> app_commands.Command:
     def format_user_label(interaction: discord.Interaction, user: discord.User) -> str:
         guild = interaction.guild
@@ -2267,6 +3170,10 @@ async def run() -> None:
     await db.connect()
 
     bot = HotmapBot(settings, db)
+    bot.tree.add_command(build_tabetai_command(bot))
+    bot.tree.add_command(build_tabetai_clear_command(bot))
+    bot.tree.add_command(build_tabetai_add_command(bot))
+    bot.tree.add_command(build_tabetai_remove_command(bot))
     bot.tree.add_command(build_hotmap_command(bot))
     bot.tree.add_command(build_message_type_chart_command(bot))
     bot.tree.add_command(build_message_type_debug_command(bot))

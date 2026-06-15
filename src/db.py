@@ -71,6 +71,28 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id BIGINT PRIMARY KEY,
     delete_log_channel_id BIGINT
 );
+
+CREATE TABLE IF NOT EXISTS meal_history (
+    id BIGSERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    meal_name TEXT NOT NULL,
+    selected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_meal_history_user_time
+ON meal_history (guild_id, user_id, selected_at DESC);
+
+CREATE TABLE IF NOT EXISTS meal_options (
+    id BIGSERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    meal_name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (guild_id, meal_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_meal_options_guild
+ON meal_options (guild_id, created_at ASC);
 """
 
 
@@ -472,3 +494,137 @@ class Database:
                 return int(result.split()[-1])
             except (IndexError, ValueError):
                 return 0
+
+    async def get_recent_meal_selections(self, guild_id: int, user_id: int, limit: int) -> List[str]:
+        if limit <= 0:
+            return []
+        assert self.pool is not None
+        query = """
+        SELECT meal_name
+        FROM meal_history
+        WHERE guild_id = $1
+          AND user_id = $2
+        ORDER BY selected_at DESC
+        LIMIT $3;
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, guild_id, user_id, limit)
+            return [str(r["meal_name"]) for r in rows]
+
+    async def insert_meal_selection(self, guild_id: int, user_id: int, meal_name: str) -> None:
+        assert self.pool is not None
+        query = """
+        INSERT INTO meal_history (guild_id, user_id, meal_name, selected_at)
+        VALUES ($1, $2, $3, NOW());
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(query, guild_id, user_id, meal_name)
+
+    async def get_meal_history_entries(
+        self,
+        guild_id: int,
+        user_id: int,
+        limit: int = 100,
+    ) -> List[Tuple[int, str, datetime]]:
+        if limit <= 0:
+            return []
+        assert self.pool is not None
+        query = """
+        SELECT id, meal_name, selected_at
+        FROM meal_history
+        WHERE guild_id = $1
+          AND user_id = $2
+        ORDER BY selected_at DESC, id DESC
+        LIMIT $3;
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, guild_id, user_id, limit)
+            return [
+                (
+                    int(r["id"]),
+                    str(r["meal_name"]),
+                    r["selected_at"],
+                )
+                for r in rows
+            ]
+
+    async def delete_meal_history_entry(self, guild_id: int, user_id: int, entry_id: int) -> bool:
+        assert self.pool is not None
+        query = """
+        DELETE FROM meal_history
+        WHERE guild_id = $1
+          AND user_id = $2
+          AND id = $3;
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(query, guild_id, user_id, entry_id)
+            try:
+                return int(result.split()[-1]) > 0
+            except (IndexError, ValueError):
+                return False
+
+    async def get_meal_options(self, guild_id: int) -> List[str]:
+        assert self.pool is not None
+        query = """
+        SELECT meal_name
+        FROM meal_options
+        WHERE guild_id = $1
+        ORDER BY created_at ASC, id ASC;
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, guild_id)
+            return [str(r["meal_name"]) for r in rows]
+
+    async def ensure_meal_options(self, guild_id: int, default_meals: List[str]) -> List[str]:
+        existing = await self.get_meal_options(guild_id)
+        if existing:
+            return existing
+
+        normalized_defaults: List[str] = []
+        seen: Set[str] = set()
+        for item in default_meals:
+            name = str(item).strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            normalized_defaults.append(name)
+
+        if not normalized_defaults:
+            return []
+
+        assert self.pool is not None
+        query = """
+        INSERT INTO meal_options (guild_id, meal_name, created_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (guild_id, meal_name) DO NOTHING;
+        """
+        async with self.pool.acquire() as conn:
+            await conn.executemany(query, [(guild_id, name) for name in normalized_defaults])
+
+        return await self.get_meal_options(guild_id)
+
+    async def add_meal_option(self, guild_id: int, meal_name: str) -> bool:
+        assert self.pool is not None
+        query = """
+        INSERT INTO meal_options (guild_id, meal_name, created_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (guild_id, meal_name) DO NOTHING
+        RETURNING id;
+        """
+        async with self.pool.acquire() as conn:
+            inserted_id = await conn.fetchval(query, guild_id, meal_name)
+            return inserted_id is not None
+
+    async def remove_meal_option(self, guild_id: int, meal_name: str) -> bool:
+        assert self.pool is not None
+        query = """
+        DELETE FROM meal_options
+        WHERE guild_id = $1
+          AND meal_name = $2;
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(query, guild_id, meal_name)
+            try:
+                return int(result.split()[-1]) > 0
+            except (IndexError, ValueError):
+                return False
