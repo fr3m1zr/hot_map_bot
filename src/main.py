@@ -50,6 +50,7 @@ OTHER_REASON_UNRECOGNIZED = "未識別格式"
 TABETAI_RECENT_MEAL_COUNT = 4
 TABETAI_ANIMATION_STEPS = 8
 TABETAI_ANIMATION_DELAY_SEC = 0.20
+RANDOM_X_NOT_X_REGEX = re.compile(r"隨機\s*(?P<x>[^\s]{1,20})\s*不\s*(?P=x)")
 TABETAI_FOODS = [
     "牛肉麵",
     "滷肉飯",
@@ -204,6 +205,17 @@ def build_tabetai_animation_embed(
         f"{progress_bar}  {step}/{total_steps}"
     )
     return embed
+
+
+def extract_random_x_not_x_options(content: str) -> Tuple[str, str] | None:
+    text = content.strip()
+    match = RANDOM_X_NOT_X_REGEX.search(text)
+    if match is None:
+        return None
+    x_value = match.group("x").strip()
+    if not x_value:
+        return None
+    return x_value, f"不{x_value}"
 
 
 def aggregate_hotmap_rows(rows: List[Tuple[str, int]]) -> Tuple[List[Tuple[str, int]], int]:
@@ -818,11 +830,27 @@ class HotmapBot(discord.Client):
             asyncio.create_task(self._run_startup_tasks())
 
     async def on_message(self, message: discord.Message) -> None:
-        if not message.guild:
-            return
         if message.author.bot:
             return
         if message.is_system():
+            return
+
+        random_x_not_x_options = extract_random_x_not_x_options(message.content or "")
+        if random_x_not_x_options is not None:
+            choice = random.choice(list(random_x_not_x_options))
+            try:
+                await message.reply(
+                    choice,
+                    mention_author=False,
+                )
+            except discord.HTTPException as exc:
+                print(
+                    "[RandomXNotX] Failed to reply "
+                    f"channel={getattr(message.channel, 'id', 'unknown')} "
+                    f"message_id={message.id}: {exc}"
+                )
+
+        if not message.guild:
             return
 
         snapshot = self._build_message_snapshot(message)
@@ -871,8 +899,21 @@ class HotmapBot(discord.Client):
         )
 
         snapshot: Dict[str, Any] | None = None
+        no_snapshot_reason: str | None = None
         cached_attachments: List[discord.Attachment] | None = None
-        if payload.cached_message is not None and not payload.cached_message.author.bot:
+        if payload.cached_message is not None:
+            if payload.cached_message.author.bot:
+                print(
+                    "[DeleteLog] Skip bot message delete log "
+                    f"guild={payload.guild_id}, channel={payload.channel_id}, message_id={payload.message_id}"
+                )
+                return
+            if payload.cached_message.is_system():
+                print(
+                    "[DeleteLog] Skip system message delete log "
+                    f"guild={payload.guild_id}, channel={payload.channel_id}, message_id={payload.message_id}"
+                )
+                return
             snapshot = self._build_message_snapshot(payload.cached_message)
             snapshot["message_id"] = payload.cached_message.id
             snapshot["guild_id"] = payload.cached_message.guild.id if payload.cached_message.guild else payload.guild_id
@@ -885,6 +926,11 @@ class HotmapBot(discord.Client):
             db_row = await self.db.get_message_snapshot(payload.message_id)
             if db_row is not None:
                 snapshot = self._build_snapshot_from_db_row(db_row)
+            else:
+                no_snapshot_reason = (
+                    "未找到訊息快照；可能原因：訊息建立時 bot 不在線、缺少頻道/討論串權限、"
+                    "快取已過期，或訊息建立後很快被刪除。"
+                )
 
         await self._send_deleted_message_log(
             guild_id=payload.guild_id,
@@ -893,6 +939,7 @@ class HotmapBot(discord.Client):
             fallback_channel_id=payload.channel_id,
             snapshot=snapshot,
             cached_attachments=cached_attachments,
+            no_snapshot_reason=no_snapshot_reason,
         )
 
     async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
@@ -914,10 +961,16 @@ class HotmapBot(discord.Client):
         )
 
         snapshot_by_id: Dict[int, Dict[str, Any]] = {}
+        no_snapshot_reasons_by_id: Dict[int, str] = {}
         cached_attachments_by_id: Dict[int, List[discord.Attachment]] = {}
+        skipped_message_ids: Set[int] = set()
         cached_messages = getattr(payload, "cached_messages", [])
         for message in cached_messages:
             if message.author.bot:
+                skipped_message_ids.add(message.id)
+                continue
+            if message.is_system():
+                skipped_message_ids.add(message.id)
                 continue
             snapshot = self._build_message_snapshot(message)
             snapshot["message_id"] = message.id
@@ -934,8 +987,20 @@ class HotmapBot(discord.Client):
             db_rows = await self.db.get_message_snapshots(uncached_ids)
             for mid, row in db_rows.items():
                 snapshot_by_id[mid] = self._build_snapshot_from_db_row(row)
+            for mid in uncached_ids:
+                if mid not in db_rows:
+                    no_snapshot_reasons_by_id[mid] = (
+                        "未找到訊息快照；可能原因：訊息建立時 bot 不在線、缺少頻道/討論串權限、"
+                        "快取已過期，或訊息建立後很快被刪除。"
+                    )
 
         for message_id in message_ids:
+            if message_id in skipped_message_ids:
+                print(
+                    "[DeleteLog] Skip bot/system message in bulk delete "
+                    f"guild={payload.guild_id}, message_id={message_id}"
+                )
+                continue
             await self._send_deleted_message_log(
                 guild_id=payload.guild_id,
                 delete_log_channel_id=delete_log_channel_id,
@@ -943,6 +1008,7 @@ class HotmapBot(discord.Client):
                 fallback_channel_id=payload.channel_id,
                 snapshot=snapshot_by_id.get(message_id),
                 cached_attachments=cached_attachments_by_id.get(message_id),
+                no_snapshot_reason=no_snapshot_reasons_by_id.get(message_id),
             )
 
     async def on_thread_create(self, thread: discord.Thread) -> None:
@@ -1165,6 +1231,7 @@ class HotmapBot(discord.Client):
         fallback_channel_id: int | None,
         snapshot: Dict[str, Any] | None,
         cached_attachments: List[discord.Attachment] | None = None,
+        no_snapshot_reason: str | None = None,
     ) -> None:
         channel_obj = self.get_channel(delete_log_channel_id)
         if not isinstance(channel_obj, discord.TextChannel):
@@ -1211,6 +1278,11 @@ class HotmapBot(discord.Client):
                 "[DeleteLog] No snapshot found for deleted message "
                 f"guild={guild_id}, message_id={message_id}, fallback_channel={fallback_channel_id}"
             )
+            if not no_snapshot_reason:
+                no_snapshot_reason = (
+                    "未找到訊息快照；可能原因：訊息建立時 bot 不在線、缺少頻道/討論串權限、"
+                    "快取已過期，或訊息建立後很快被刪除。"
+                )
 
         if created_at is not None and isinstance(created_at, str):
             try:
@@ -1265,6 +1337,13 @@ class HotmapBot(discord.Client):
             ),
             inline=False,
         )
+
+        if snapshot is None and no_snapshot_reason:
+            embed.add_field(
+                name="快照狀態",
+                value=truncate_text(no_snapshot_reason, 1000),
+                inline=False,
+            )
 
         if reference_message_id:
             if reply_mention_enabled is None and reference_author_id:
