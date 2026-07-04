@@ -52,6 +52,8 @@ TABETAI_ANIMATION_STEPS = 8
 TABETAI_ANIMATION_DELAY_SEC = 0.20
 RANDOM_X_NOT_X_REGEX = re.compile(r"(?P<x>[^\s]{1,20})\s*不\s*(?P=x)")
 RANDOM_TRIGGER_PREFIX = "神奇海螺"
+RANDOM_USER_COOLDOWN_SEC = 5 * 60
+RANDOM_GLOBAL_COOLDOWN_SEC = 20
 CHANNEL_TOP_USER_MIN_DIVISOR = 3
 CHANNEL_TOP_USER_PAGE_SIZE = 15
 YORUSHIKA_TAKE_TRIGGER_TEXT = "拿不拿"
@@ -355,6 +357,16 @@ def should_trigger_yorushika_pick(content: str) -> bool:
     if not text.startswith(RANDOM_TRIGGER_PREFIX):
         return False
     return YORUSHIKA_TAKE_TRIGGER_TEXT in text
+
+
+def format_cooldown_duration(until: datetime, now: datetime) -> str:
+    remaining_seconds = max(1, int((until - now).total_seconds() + 0.999))
+    minutes, seconds = divmod(remaining_seconds, 60)
+    if minutes > 0 and seconds > 0:
+        return f"{minutes}分{seconds:02d}秒"
+    if minutes > 0:
+        return f"{minutes}分鐘"
+    return f"{seconds}秒"
 
 
 def build_yorushika_spotify_embed(song: Dict[str, str]) -> discord.Embed:
@@ -968,6 +980,8 @@ class HotmapBot(discord.Client):
         self.cleanup_on_startup = bool(self.settings.cleanup_on_startup)
         self.cleanup_days = max(1, min(180, int(self.settings.cleanup_days)))
         self.active_tabetai_sessions: Set[Tuple[int, int]] = set()
+        self.random_user_cooldown_until_by_user: Dict[int, datetime] = {}
+        self.random_global_cooldown_until: datetime | None = None
 
     async def setup_hook(self) -> None:
         print("Starting global slash command sync...")
@@ -986,6 +1000,65 @@ class HotmapBot(discord.Client):
             self.startup_thread_scan_done = True
             asyncio.create_task(self._run_startup_tasks())
 
+    def _can_bypass_random_cooldown(self, message: discord.Message) -> bool:
+        return (
+            isinstance(message.author, discord.Member)
+            and message.author.guild_permissions.administrator
+        )
+
+    def _get_random_cooldown_messages(self, user_id: int, now: datetime) -> List[str]:
+        messages: List[str] = []
+
+        user_until = self.random_user_cooldown_until_by_user.get(user_id)
+        if user_until is not None and user_until <= now:
+            self.random_user_cooldown_until_by_user.pop(user_id, None)
+            user_until = None
+        if user_until is not None:
+            messages.append(f"使用者 {format_cooldown_duration(user_until, now)}")
+
+        global_until = self.random_global_cooldown_until
+        if global_until is not None and global_until <= now:
+            self.random_global_cooldown_until = None
+            global_until = None
+        if global_until is not None:
+            messages.append(f"全體 {format_cooldown_duration(global_until, now)}")
+
+        return messages
+
+    async def _send_random_cooldown_notice(
+        self,
+        message: discord.Message,
+        cooldown_messages: List[str],
+    ) -> None:
+        if not cooldown_messages:
+            return
+        text = "\n".join(
+            [
+                "**冷卻中**",
+                "-# 目前冷卻規則 5分鐘/使用者 20秒/全體",
+            ]
+        )
+        try:
+            await message.reply(
+                text,
+                mention_author=False,
+                delete_after=5,
+            )
+        except discord.HTTPException as exc:
+            print(
+                "[RandomCooldown] Failed to reply "
+                f"channel={getattr(message.channel, 'id', 'unknown')} "
+                f"message_id={message.id}: {exc}"
+            )
+
+    def _mark_random_cooldown(self, user_id: int, now: datetime) -> None:
+        self.random_user_cooldown_until_by_user[user_id] = now + timedelta(
+            seconds=RANDOM_USER_COOLDOWN_SEC
+        )
+        self.random_global_cooldown_until = now + timedelta(
+            seconds=RANDOM_GLOBAL_COOLDOWN_SEC
+        )
+
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
             return
@@ -993,34 +1066,51 @@ class HotmapBot(discord.Client):
             return
 
         message_text = message.content or ""
-        if should_trigger_yorushika_pick(message_text):
-            selected_song = random.choice(MUSIC_PICK_SONGS)
-            try:
-                await message.reply(
-                    embed=build_yorushika_spotify_embed(selected_song),
-                    mention_author=False,
-                )
-            except discord.HTTPException as exc:
-                print(
-                    "[MusicPick] Failed to reply "
-                    f"channel={getattr(message.channel, 'id', 'unknown')} "
-                    f"message_id={message.id}: {exc}"
-                )
-        else:
-            random_x_not_x_options = extract_random_x_not_x_options(message_text)
-            if random_x_not_x_options is not None:
-                choice = random.choice(list(random_x_not_x_options))
+        random_triggered = message_text.strip().startswith(RANDOM_TRIGGER_PREFIX)
+        random_bypass = self._can_bypass_random_cooldown(message)
+        random_replied = False
+
+        if random_triggered and not random_bypass:
+            now = datetime.now(timezone.utc)
+            cooldown_messages = self._get_random_cooldown_messages(message.author.id, now)
+            if cooldown_messages:
+                await self._send_random_cooldown_notice(message, cooldown_messages)
+                random_triggered = False
+
+        if random_triggered:
+            if should_trigger_yorushika_pick(message_text):
+                selected_song = random.choice(MUSIC_PICK_SONGS)
                 try:
                     await message.reply(
-                        choice,
+                        embed=build_yorushika_spotify_embed(selected_song),
                         mention_author=False,
                     )
+                    random_replied = True
                 except discord.HTTPException as exc:
                     print(
-                        "[RandomXNotX] Failed to reply "
+                        "[MusicPick] Failed to reply "
                         f"channel={getattr(message.channel, 'id', 'unknown')} "
                         f"message_id={message.id}: {exc}"
                     )
+            else:
+                random_x_not_x_options = extract_random_x_not_x_options(message_text)
+                if random_x_not_x_options is not None:
+                    choice = random.choice(list(random_x_not_x_options))
+                    try:
+                        await message.reply(
+                            choice,
+                            mention_author=False,
+                        )
+                        random_replied = True
+                    except discord.HTTPException as exc:
+                        print(
+                            "[RandomXNotX] Failed to reply "
+                            f"channel={getattr(message.channel, 'id', 'unknown')} "
+                            f"message_id={message.id}: {exc}"
+                        )
+
+        if random_replied and not random_bypass:
+            self._mark_random_cooldown(message.author.id, datetime.now(timezone.utc))
 
         if not message.guild:
             return
