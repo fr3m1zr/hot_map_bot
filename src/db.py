@@ -386,13 +386,18 @@ class Database:
         channel_id: int,
         from_time: datetime,
         limit: int = 10,
-    ) -> List[Tuple[int, int]]:
+    ) -> List[Tuple[int, str, int]]:
         if limit <= 0:
             return []
         assert self.pool is not None
         query = """
         SELECT
             author_id,
+            COALESCE(
+                (ARRAY_AGG(author_display_name ORDER BY created_at DESC)
+                    FILTER (WHERE author_display_name <> ''))[1],
+                ''
+            ) AS author_display_name,
             COUNT(*)::BIGINT AS cnt
         FROM messages
         WHERE guild_id = $1
@@ -410,7 +415,58 @@ class Database:
         """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(query, guild_id, channel_id, from_time, limit)
-            return [(int(r["author_id"]), int(r["cnt"])) for r in rows]
+            return [
+                (
+                    int(r["author_id"]),
+                    str(r["author_display_name"] or ""),
+                    int(r["cnt"]),
+                )
+                for r in rows
+            ]
+
+    async def get_channel_user_activity_ranking_by_channel_ids(
+        self,
+        guild_id: int,
+        channel_ids: List[int],
+        from_time: datetime,
+        limit: int = 10,
+    ) -> List[Tuple[int, str, int]]:
+        if limit <= 0 or not channel_ids:
+            return []
+        assert self.pool is not None
+        query = """
+        SELECT
+            author_id,
+            COALESCE(
+                (ARRAY_AGG(author_display_name ORDER BY created_at DESC)
+                    FILTER (WHERE author_display_name <> ''))[1],
+                ''
+            ) AS author_display_name,
+            COUNT(*)::BIGINT AS cnt
+        FROM messages
+        WHERE guild_id = $1
+          AND channel_id = ANY($2::BIGINT[])
+          AND created_at >= $3
+          AND (
+            content <> ''
+            OR attachments_json <> '[]'
+            OR stickers_json <> '[]'
+            OR custom_emojis_json <> '[]'
+          )
+        GROUP BY author_id
+        ORDER BY cnt DESC, author_id ASC
+        LIMIT $4;
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, guild_id, channel_ids, from_time, limit)
+            return [
+                (
+                    int(r["author_id"]),
+                    str(r["author_display_name"] or ""),
+                    int(r["cnt"]),
+                )
+                for r in rows
+            ]
 
     async def get_channels_top_active_users(
         self,

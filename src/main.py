@@ -8,10 +8,10 @@ import traceback
 import unicodedata
 from typing import Any, Dict, List, Set, Tuple
 
-import discord
-from discord import app_commands
-from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont
+import discord # pyright: ignore[reportMissingImports]
+from discord import app_commands # pyright: ignore[reportMissingImports]
+from dotenv import load_dotenv # pyright: ignore[reportMissingImports]
+from PIL import Image, ImageDraw, ImageFont # pyright: ignore[reportMissingImports]
 
 from .config import Settings
 from .db import Database
@@ -3106,12 +3106,18 @@ def build_channel_activity_top_command(bot: HotmapBot) -> app_commands.Command:
         lines = [
             f"Here is {context_label} in last {days_value} day(s) active user ranking (top {len(rows)}).",
         ]
-        for index, (author_id, count) in enumerate(rows, start=1):
+        for index, (author_id, author_display_name, count) in enumerate(rows, start=1):
             member_obj = guild.get_member(author_id)
+            if member_obj is None:
+                try:
+                    member_obj = await guild.fetch_member(author_id)
+                except discord.HTTPException:
+                    member_obj = None
             if member_obj is not None:
-                display_text = f"<@{author_id}> ({member_obj.display_name})"
-            else:
                 display_text = f"<@{author_id}>"
+            else:
+                display_name = author_display_name or "unknown-user"
+                display_text = f"@{display_name}"
             lines.append(f"{index}. {display_text} - {format_count(count)}")
 
         await interaction.followup.send(
