@@ -380,6 +380,83 @@ class Database:
                 for r in rows
             ]
 
+    async def get_channel_user_activity_ranking(
+        self,
+        guild_id: int,
+        channel_id: int,
+        from_time: datetime,
+        limit: int = 10,
+    ) -> List[Tuple[int, int]]:
+        if limit <= 0:
+            return []
+        assert self.pool is not None
+        query = """
+        SELECT
+            author_id,
+            COUNT(*)::BIGINT AS cnt
+        FROM messages
+        WHERE guild_id = $1
+          AND channel_id = $2
+          AND created_at >= $3
+          AND (
+            content <> ''
+            OR attachments_json <> '[]'
+            OR stickers_json <> '[]'
+            OR custom_emojis_json <> '[]'
+          )
+        GROUP BY author_id
+        ORDER BY cnt DESC, author_id ASC
+        LIMIT $4;
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, guild_id, channel_id, from_time, limit)
+            return [(int(r["author_id"]), int(r["cnt"])) for r in rows]
+
+    async def get_channels_top_active_users(
+        self,
+        guild_id: int,
+        from_time: datetime,
+    ) -> List[Tuple[int, str, int, int]]:
+        assert self.pool is not None
+        query = """
+        WITH ranked AS (
+            SELECT
+                channel_id,
+                channel_name,
+                author_id,
+                COUNT(*)::BIGINT AS cnt,
+                ROW_NUMBER() OVER (
+                    PARTITION BY channel_id
+                    ORDER BY COUNT(*) DESC, author_id ASC
+                ) AS rn
+            FROM messages
+            WHERE guild_id = $1
+              AND created_at >= $2
+              AND (
+                content <> ''
+                OR attachments_json <> '[]'
+                OR stickers_json <> '[]'
+                OR custom_emojis_json <> '[]'
+              )
+            GROUP BY channel_id, channel_name, author_id
+        )
+        SELECT channel_id, channel_name, author_id, cnt
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY cnt DESC, channel_id ASC;
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, guild_id, from_time)
+            return [
+                (
+                    int(r["channel_id"]),
+                    str(r["channel_name"] or f"channel-{int(r['channel_id'])}"),
+                    int(r["author_id"]),
+                    int(r["cnt"]),
+                )
+                for r in rows
+            ]
+
     async def get_kv(self, key: str) -> str | None:
         assert self.pool is not None
         query = "SELECT value FROM bot_kv WHERE key = $1;"

@@ -50,7 +50,133 @@ OTHER_REASON_UNRECOGNIZED = "未識別格式"
 TABETAI_RECENT_MEAL_COUNT = 4
 TABETAI_ANIMATION_STEPS = 8
 TABETAI_ANIMATION_DELAY_SEC = 0.20
-RANDOM_X_NOT_X_REGEX = re.compile(r"隨機\s*(?P<x>[^\s]{1,20})\s*不\s*(?P=x)")
+RANDOM_X_NOT_X_REGEX = re.compile(r"(?P<x>[^\s]{1,20})\s*不\s*(?P=x)")
+RANDOM_TRIGGER_PREFIX = "神奇海螺"
+CHANNEL_TOP_USER_MIN_DIVISOR = 3
+CHANNEL_TOP_USER_PAGE_SIZE = 15
+YORUSHIKA_TAKE_TRIGGER_TEXT = "拿不拿"
+MUSIC_PICK_SONGS: List[Dict[str, str]] = [
+    {
+        "title": "ただ君に晴れ",
+        "artist": "ヨルシカ",
+        "source": "YORUSHIKA",
+        "album": "負け犬にアンコールはいらない",
+        "duration": "3:18",
+        "spotify_url": "https://open.spotify.com/search/%E3%81%9F%E3%81%A0%E5%90%9B%E3%81%AB%E6%99%B4%E3%82%8C%20%E3%83%A8%E3%83%AB%E3%82%B7%E3%82%AB",
+    },
+    {
+        "title": "だから僕は音楽を辞めた",
+        "artist": "ヨルシカ",
+        "source": "YORUSHIKA",
+        "album": "だから僕は音楽を辞めた",
+        "duration": "4:02",
+        "spotify_url": "https://open.spotify.com/search/%E3%81%A0%E3%81%8B%E3%82%89%E5%83%95%E3%81%AF%E9%9F%B3%E6%A5%BD%E3%82%92%E8%BE%9E%E3%82%81%E3%81%9F%20%E3%83%A8%E3%83%AB%E3%82%B7%E3%82%AB",
+    },
+    {
+        "title": "雨とカプチーノ",
+        "artist": "ヨルシカ",
+        "source": "YORUSHIKA",
+        "album": "エルマ",
+        "duration": "4:29",
+        "spotify_url": "https://open.spotify.com/search/%E9%9B%A8%E3%81%A8%E3%82%AB%E3%83%97%E3%83%81%E3%83%BC%E3%83%8E%20%E3%83%A8%E3%83%AB%E3%82%B7%E3%82%AB",
+    },
+    {
+        "title": "藍二乗",
+        "artist": "ヨルシカ",
+        "source": "YORUSHIKA",
+        "album": "だから僕は音楽を辞めた",
+        "duration": "4:22",
+        "spotify_url": "https://open.spotify.com/search/%E8%97%8D%E4%BA%8C%E4%B9%97%20%E3%83%A8%E3%83%AB%E3%82%B7%E3%82%AB",
+    },
+    {
+        "title": "花に亡霊",
+        "artist": "ヨルシカ",
+        "source": "YORUSHIKA",
+        "album": "盗作",
+        "duration": "4:00",
+        "spotify_url": "https://open.spotify.com/search/%E8%8A%B1%E3%81%AB%E4%BA%A1%E9%9C%8A%20%E3%83%A8%E3%83%AB%E3%82%B7%E3%82%AB",
+    },
+    {
+        "title": "春泥棒",
+        "artist": "ヨルシカ",
+        "source": "YORUSHIKA",
+        "album": "創作",
+        "duration": "4:48",
+        "spotify_url": "https://open.spotify.com/search/%E6%98%A5%E6%B3%A5%E6%A3%92%20%E3%83%A8%E3%83%AB%E3%82%B7%E3%82%AB",
+    },
+    {
+        "title": "思想犯",
+        "artist": "ヨルシカ",
+        "source": "YORUSHIKA",
+        "album": "盗作",
+        "duration": "4:13",
+        "spotify_url": "https://open.spotify.com/search/%E6%80%9D%E6%83%B3%E7%8A%AF%20%E3%83%A8%E3%83%AB%E3%82%B7%E3%82%AB",
+    },
+    {
+        "title": "左右盲",
+        "artist": "ヨルシカ",
+        "source": "YORUSHIKA",
+        "album": "幻燈",
+        "duration": "4:36",
+        "spotify_url": "https://open.spotify.com/search/%E5%B7%A6%E5%8F%B3%E7%9B%B2%20%E3%83%A8%E3%83%AB%E3%82%B7%E3%82%AB",
+    },
+    {
+        "title": "夜行",
+        "artist": "ヨルシカ",
+        "source": "YORUSHIKA",
+        "album": "創作",
+        "duration": "3:22",
+        "spotify_url": "https://open.spotify.com/search/%E5%A4%9C%E8%A1%8C%20%E3%83%A8%E3%83%AB%E3%82%B7%E3%82%AB",
+    },
+    {
+        "title": "晴る",
+        "artist": "ヨルシカ",
+        "source": "YORUSHIKA",
+        "album": "幻燈",
+        "duration": "3:45",
+        "spotify_url": "https://open.spotify.com/search/%E6%99%B4%E3%82%8B%20%E3%83%A8%E3%83%AB%E3%82%B7%E3%82%AB",
+    },
+    {
+        "title": "ウミユリ海底譚",
+        "artist": "n-buna feat. 初音ミク",
+        "source": "n-buna VOCALOID",
+        "album": "花と水飴、最終電車",
+        "duration": "3:59",
+        "spotify_url": "https://open.spotify.com/search/%E3%82%A6%E3%83%9F%E3%83%A6%E3%83%AA%E6%B5%B7%E5%BA%95%E8%AD%9A%20n-buna",
+    },
+    {
+        "title": "夜明けと蛍",
+        "artist": "n-buna feat. 初音ミク",
+        "source": "n-buna VOCALOID",
+        "album": "花と水飴、最終電車",
+        "duration": "5:09",
+        "spotify_url": "https://open.spotify.com/search/%E5%A4%9C%E6%98%8E%E3%81%91%E3%81%A8%E8%9B%8D%20n-buna",
+    },
+    {
+        "title": "メリュー",
+        "artist": "n-buna feat. 初音ミク",
+        "source": "n-buna VOCALOID",
+        "album": "花と水飴、最終電車",
+        "duration": "3:34",
+        "spotify_url": "https://open.spotify.com/search/%E3%83%A1%E3%83%AA%E3%83%A5%E3%83%BC%20n-buna",
+    },
+    {
+        "title": "背景、夏に溺れる",
+        "artist": "n-buna feat. 初音ミク",
+        "source": "n-buna VOCALOID",
+        "album": "花と水飴、最終電車",
+        "duration": "5:15",
+        "spotify_url": "https://open.spotify.com/search/%E8%83%8C%E6%99%AF%E3%80%81%E5%A4%8F%E3%81%AB%E6%BA%BA%E3%82%8C%E3%82%8B%20n-buna",
+    },
+    {
+        "title": "透明エレジー",
+        "artist": "n-buna feat. GUMI",
+        "source": "n-buna VOCALOID",
+        "album": "花と水飴、最終電車",
+        "duration": "3:43",
+        "spotify_url": "https://open.spotify.com/search/%E9%80%8F%E6%98%8E%E3%82%A8%E3%83%AC%E3%82%B8%E3%83%BC%20n-buna",
+    },
+]
 TABETAI_FOODS = [
     "牛肉麵",
     "滷肉飯",
@@ -209,13 +335,44 @@ def build_tabetai_animation_embed(
 
 def extract_random_x_not_x_options(content: str) -> Tuple[str, str] | None:
     text = content.strip()
-    match = RANDOM_X_NOT_X_REGEX.search(text)
+    if not text.startswith(RANDOM_TRIGGER_PREFIX):
+        return None
+    body = text[len(RANDOM_TRIGGER_PREFIX) :].strip()
+    if not body:
+        return None
+
+    match = RANDOM_X_NOT_X_REGEX.search(body)
     if match is None:
         return None
     x_value = match.group("x").strip()
     if not x_value:
         return None
     return x_value, f"不{x_value}"
+
+
+def should_trigger_yorushika_pick(content: str) -> bool:
+    text = content.strip()
+    if not text.startswith(RANDOM_TRIGGER_PREFIX):
+        return False
+    return YORUSHIKA_TAKE_TRIGGER_TEXT in text
+
+
+def build_yorushika_spotify_embed(song: Dict[str, str]) -> discord.Embed:
+    embed = discord.Embed(
+        title="▶ Spotify Now Playing",
+        description=f"**{song['title']}**",
+        color=0x1DB954,
+    )
+    embed.add_field(name="Artist", value=to_text(song.get("artist")), inline=True)
+    embed.add_field(name="Source", value=to_text(song.get("source")), inline=True)
+    embed.add_field(name="Album", value=to_text(song.get("album")), inline=True)
+    embed.add_field(name="Duration", value=to_text(song.get("duration")), inline=True)
+    embed.add_field(name="Progress", value="▰▰▰▰▱▱▱▱▱  1:42 / " + to_text(song.get("duration")), inline=False)
+    spotify_url = to_text(song.get("spotify_url"))
+    if spotify_url:
+        embed.add_field(name="Open in Spotify", value=f"[Play on Spotify]({spotify_url})", inline=False)
+    embed.set_footer(text="隨機推薦：YORUSHIKA / n-buna VOCALOID")
+    return embed
 
 
 def aggregate_hotmap_rows(rows: List[Tuple[str, int]]) -> Tuple[List[Tuple[str, int]], int]:
@@ -835,20 +992,35 @@ class HotmapBot(discord.Client):
         if message.is_system():
             return
 
-        random_x_not_x_options = extract_random_x_not_x_options(message.content or "")
-        if random_x_not_x_options is not None:
-            choice = random.choice(list(random_x_not_x_options))
+        message_text = message.content or ""
+        if should_trigger_yorushika_pick(message_text):
+            selected_song = random.choice(MUSIC_PICK_SONGS)
             try:
                 await message.reply(
-                    choice,
+                    embed=build_yorushika_spotify_embed(selected_song),
                     mention_author=False,
                 )
             except discord.HTTPException as exc:
                 print(
-                    "[RandomXNotX] Failed to reply "
+                    "[MusicPick] Failed to reply "
                     f"channel={getattr(message.channel, 'id', 'unknown')} "
                     f"message_id={message.id}: {exc}"
                 )
+        else:
+            random_x_not_x_options = extract_random_x_not_x_options(message_text)
+            if random_x_not_x_options is not None:
+                choice = random.choice(list(random_x_not_x_options))
+                try:
+                    await message.reply(
+                        choice,
+                        mention_author=False,
+                    )
+                except discord.HTTPException as exc:
+                    print(
+                        "[RandomXNotX] Failed to reply "
+                        f"channel={getattr(message.channel, 'id', 'unknown')} "
+                        f"message_id={message.id}: {exc}"
+                    )
 
         if not message.guild:
             return
@@ -2347,6 +2519,110 @@ class TabetaiHistoryClearView(discord.ui.View):
                 pass
 
 
+class ChannelsTopUserPaginationView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild | None,
+        invoker_user_id: int,
+        days: int,
+        min_messages: int,
+        rows: List[Tuple[int, str, int, int]],
+    ) -> None:
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.invoker_user_id = invoker_user_id
+        self.days = days
+        self.min_messages = min_messages
+        self.rows = rows
+        self.page_size = CHANNEL_TOP_USER_PAGE_SIZE
+        self.page_index = 0
+        self.message: discord.Message | None = None
+        self._sync_buttons()
+
+    def _max_page_index(self) -> int:
+        if not self.rows:
+            return 0
+        return (len(self.rows) - 1) // self.page_size
+
+    def _sync_buttons(self) -> None:
+        self.prev_page_button.disabled = self.page_index <= 0
+        self.next_page_button.disabled = self.page_index >= self._max_page_index()
+
+    def _current_rows(self) -> List[Tuple[int, str, int, int]]:
+        start = self.page_index * self.page_size
+        end = start + self.page_size
+        return self.rows[start:end]
+
+    def build_page_text(self) -> str:
+        lines = [
+            f"Here is each channel's top active user in last {self.days} day(s).",
+            f"Threshold: >= {self.min_messages} messages.",
+            f"Page {self.page_index + 1}/{self._max_page_index() + 1} (channels: {len(self.rows)}).",
+            "",
+        ]
+        start_rank = self.page_index * self.page_size + 1
+        for offset, (channel_id, channel_name, author_id, count) in enumerate(self._current_rows()):
+            rank = start_rank + offset
+            channel_obj: discord.abc.GuildChannel | discord.Thread | None = None
+            if self.guild is not None:
+                channel_obj = self.guild.get_channel(channel_id)
+                if channel_obj is None:
+                    channel_obj = self.guild.get_thread(channel_id)
+            if channel_obj is not None:
+                channel_text = f"<#{channel_id}>"
+            else:
+                channel_label = clean_channel_label_for_chart(channel_name) or "unknown-channel"
+                channel_text = f"<#{channel_id}> ({channel_label})"
+
+            member_obj = self.guild.get_member(author_id) if self.guild is not None else None
+            if member_obj is not None:
+                user_text = f"<@{author_id}>"
+            else:
+                user_text = f"<@{author_id}> (unknown-user)"
+            lines.append(f"{rank}. {channel_text}: {user_text} - {format_count(count)}")
+        return "\n".join(lines)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_user_id:
+            await interaction.response.send_message(
+                "Only the command invoker can switch pages.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="⬅️ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_page_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.page_index = max(0, self.page_index - 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(
+            content=self.build_page_text(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
+        )
+
+    @discord.ui.button(label="Next ➡️", style=discord.ButtonStyle.secondary)
+    async def next_page_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.page_index = min(self._max_page_index(), self.page_index + 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(
+            content=self.build_page_text(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
+        )
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
 def build_tabetai_command(bot: HotmapBot) -> app_commands.Command:
     @app_commands.command(
         name="tabetai",
@@ -2735,6 +3011,229 @@ def build_hotmap_command(bot: HotmapBot) -> app_commands.Command:
         await interaction.followup.send(f"```text\n{result}\n```", file=file)
 
     return hotmap
+
+
+def build_channel_activity_top_command(bot: HotmapBot) -> app_commands.Command:
+    async def collect_forum_thread_ids(forum: discord.ForumChannel) -> List[int]:
+        thread_ids: Set[int] = set()
+
+        for thread in forum.threads:
+            thread_ids.add(thread.id)
+
+        try:
+            active_threads = await forum.guild.active_threads()
+            for thread in active_threads:
+                if thread.parent_id == forum.id:
+                    thread_ids.add(thread.id)
+        except discord.HTTPException:
+            pass
+
+        try:
+            async for thread in forum.archived_threads(limit=200):
+                thread_ids.add(thread.id)
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
+
+        return sorted(thread_ids)
+
+    @app_commands.command(
+        name="channel_top",
+        description="Show channel/thread/forum active user ranking (top 10, max 180 days).",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(
+        channel="Target channel/thread/forum",
+        days="Range in days (max 180)",
+    )
+    async def channel_top(
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | discord.Thread | discord.ForumChannel,
+        days: app_commands.Range[int, 1, 180] | None = None,
+    ) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You need server administrator permission to use this command.",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        guild_id = interaction.guild_id
+        if guild is None or guild_id is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+        days_value = days or bot.settings.default_days
+        days_value = min(days_value, bot.settings.max_days)
+        from_time = datetime.now(timezone.utc) - timedelta(days=days_value)
+
+        context_label = channel.mention
+        if isinstance(channel, discord.ForumChannel):
+            thread_ids = await collect_forum_thread_ids(channel)
+            if not thread_ids:
+                await interaction.followup.send(
+                    f"No threads found under {channel.mention} for last {days_value} day(s)."
+                )
+                return
+            rows = await bot.db.get_channel_user_activity_ranking_by_channel_ids(
+                guild_id=guild_id,
+                channel_ids=thread_ids,
+                from_time=from_time,
+                limit=10,
+            )
+            context_label = f"{channel.mention} (forum aggregate)"
+        else:
+            rows = await bot.db.get_channel_user_activity_ranking(
+                guild_id=guild_id,
+                channel_id=channel.id,
+                from_time=from_time,
+                limit=10,
+            )
+        if not rows:
+            await interaction.followup.send(
+                f"No active users found in {context_label} for last {days_value} day(s)."
+            )
+            return
+
+        lines = [
+            f"Here is {context_label} in last {days_value} day(s) active user ranking (top {len(rows)}).",
+        ]
+        for index, (author_id, count) in enumerate(rows, start=1):
+            member_obj = guild.get_member(author_id)
+            if member_obj is not None:
+                display_text = f"<@{author_id}> ({member_obj.display_name})"
+            else:
+                display_text = f"<@{author_id}>"
+            lines.append(f"{index}. {display_text} - {format_count(count)}")
+
+        await interaction.followup.send(
+            "\n".join(lines),
+            allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
+        )
+
+    return channel_top
+
+
+def build_channels_top_user_command(bot: HotmapBot) -> app_commands.Command:
+    @app_commands.command(
+        name="channels_top_user",
+        description="Show top active user per channel/thread/forum (max 180 days).",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(days="Range in days (max 180)")
+    async def channels_top_user(
+        interaction: discord.Interaction,
+        days: app_commands.Range[int, 1, 180] | None = None,
+    ) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You need server administrator permission to use this command.",
+                ephemeral=True,
+            )
+            return
+
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+        days_value = days or bot.settings.default_days
+        days_value = min(days_value, bot.settings.max_days)
+        from_time = datetime.now(timezone.utc) - timedelta(days=days_value)
+
+        rows = await bot.db.get_channels_top_active_users(
+            guild_id=guild_id,
+            from_time=from_time,
+        )
+        if not rows:
+            await interaction.followup.send(
+                f"No active channels found in last {days_value} day(s)."
+            )
+            return
+
+        guild = interaction.guild
+        forum_author_counts: Dict[int, Dict[int, int]] = {}
+        forum_name_by_id: Dict[int, str] = {}
+        existing_channel_ids = {channel_id for channel_id, _, _, _ in rows}
+        if guild is not None:
+            for channel_id, _channel_name, author_id, count in rows:
+                channel_obj = guild.get_channel(channel_id)
+                if channel_obj is None:
+                    channel_obj = guild.get_thread(channel_id)
+                if not isinstance(channel_obj, discord.Thread):
+                    continue
+                parent = channel_obj.parent
+                if not isinstance(parent, discord.ForumChannel):
+                    continue
+                forum_id = parent.id
+                forum_name_by_id[forum_id] = parent.name
+                bucket = forum_author_counts.setdefault(forum_id, {})
+                bucket[author_id] = bucket.get(author_id, 0) + count
+
+        forum_rows: List[Tuple[int, str, int, int]] = []
+        for forum_id, author_counts in forum_author_counts.items():
+            if forum_id in existing_channel_ids:
+                continue
+            top_author, top_count = sorted(author_counts.items(), key=lambda item: (-item[1], item[0]))[0]
+            forum_name = forum_name_by_id.get(forum_id, f"forum-{forum_id}")
+            forum_rows.append((forum_id, f"[Forum] {forum_name}", top_author, top_count))
+
+        merged_rows = list(rows) + forum_rows
+        merged_rows.sort(key=lambda item: (-item[3], item[0]))
+
+        min_messages = max(1, days_value // CHANNEL_TOP_USER_MIN_DIVISOR)
+        filtered_rows = [item for item in merged_rows if item[3] >= min_messages]
+        if not filtered_rows:
+            await interaction.followup.send(
+                f"No channels reached threshold >= {min_messages} messages in last {days_value} day(s)."
+            )
+            return
+
+        if len(filtered_rows) <= CHANNEL_TOP_USER_PAGE_SIZE:
+            single_page_view = ChannelsTopUserPaginationView(
+                guild=interaction.guild,
+                invoker_user_id=interaction.user.id,
+                days=days_value,
+                min_messages=min_messages,
+                rows=filtered_rows,
+            )
+            await interaction.followup.send(
+                single_page_view.build_page_text(),
+                allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
+            )
+            return
+
+        pager_view = ChannelsTopUserPaginationView(
+            guild=interaction.guild,
+            invoker_user_id=interaction.user.id,
+            days=days_value,
+            min_messages=min_messages,
+            rows=filtered_rows,
+        )
+        pager_view._sync_buttons()
+        sent_message = await interaction.followup.send(
+            pager_view.build_page_text(),
+            view=pager_view,
+            allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
+            wait=True,
+        )
+        pager_view.message = sent_message
+
+    return channels_top_user
 
 
 def build_message_type_chart_command(bot: HotmapBot) -> app_commands.Command:
@@ -3254,6 +3753,8 @@ async def run() -> None:
     bot.tree.add_command(build_tabetai_add_command(bot))
     bot.tree.add_command(build_tabetai_remove_command(bot))
     bot.tree.add_command(build_hotmap_command(bot))
+    bot.tree.add_command(build_channel_activity_top_command(bot))
+    bot.tree.add_command(build_channels_top_user_command(bot))
     bot.tree.add_command(build_message_type_chart_command(bot))
     bot.tree.add_command(build_message_type_debug_command(bot))
     bot.tree.add_command(build_message_inspect_command(bot))
