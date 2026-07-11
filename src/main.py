@@ -50,6 +50,12 @@ OTHER_REASON_UNRECOGNIZED = "未識別格式"
 TABETAI_RECENT_MEAL_COUNT = 4
 TABETAI_ANIMATION_STEPS = 8
 TABETAI_ANIMATION_DELAY_SEC = 0.20
+RANDOM_X_NOT_X_RESULT_REGEX = re.compile(
+    r"(?P<x>[^\s不嗎?？]{1,20})\s*不\s*(?P=x)\s*[得的]\s*(?P<result>到|懂|及|動|起|完|下|住|成)"
+)
+RANDOM_RESULT_MODAL_REGEX = re.compile(
+    r"(?P<x>[^\s不嗎?？]{1,20})\s*[得的]\s*(?P<result>到|懂|及|動|起|完|下|住|成).*[嗎?？]$"
+)
 RANDOM_X_NOT_X_REGEX = re.compile(r"(?P<x>[^\s]{1,20})\s*不\s*(?P=x)")
 RANDOM_TRIGGER_PREFIX = "神奇海螺"
 RANDOM_USER_COOLDOWN_SEC = 5 * 60
@@ -342,6 +348,128 @@ def extract_random_x_not_x_options(content: str) -> Tuple[str, str] | None:
     body = text[len(RANDOM_TRIGGER_PREFIX) :].strip()
     if not body:
         return None
+
+    compact_body = re.sub(r"\s+", "", body).rstrip("。.!！?？")
+    confirmation_question_patterns = [
+        (r"對嗎$", "對", "不對"),
+        (r"是嗎$", "是", "不是"),
+        (r"確定嗎$", "確定", "不確定"),
+    ]
+    for pattern, yes_value, no_value in confirmation_question_patterns:
+        if re.search(pattern, compact_body):
+            return yes_value, no_value
+
+    result_match = RANDOM_X_NOT_X_RESULT_REGEX.search(body)
+    if result_match is not None:
+        x_value = result_match.group("x").strip()
+        result_value = result_match.group("result").strip()
+        if x_value:
+            return f"{x_value}得{result_value}", f"{x_value}不{result_value}"
+
+    result_modal_match = RANDOM_RESULT_MODAL_REGEX.search(body)
+    if result_modal_match is not None:
+        x_value = result_modal_match.group("x").strip()
+        result_value = result_modal_match.group("result").strip()
+        if x_value:
+            return f"{x_value}得{result_value}", f"{x_value}不{result_value}"
+
+    fixed_patterns = [
+        ("OK不OK", "OK", "不OK"),
+        ("ok不ok", "OK", "不OK"),
+        ("值不值得", "值得", "不值得"),
+        ("喜不喜歡", "喜歡", "不喜歡"),
+        ("知不知道", "知道", "不知道"),
+        ("認不認識", "認識", "不認識"),
+        ("記不記得", "記得", "不記得"),
+        ("忘不忘記", "忘記", "不忘記"),
+        ("建不建議", "建議", "不建議"),
+        ("推不推薦", "推薦", "不推薦"),
+        ("適不適合", "適合", "不適合"),
+        ("可不可行", "可行", "不可行"),
+        ("划不划算", "划算", "不划算"),
+        ("劃不劃算", "划算", "不划算"),
+        ("有沒有差", "有差", "沒差"),
+        ("有沒有空", "有空", "沒空"),
+        ("有沒有救", "有救", "沒救"),
+        ("有沒有戲", "有戲", "沒戲"),
+        ("有沒有料", "有料", "沒料"),
+        ("有沒有機會", "有機會", "沒機會"),
+        ("有沒有可能", "有可能", "不可能"),
+        ("需不需要", "需要", "不需要"),
+        ("可不可以", "可以", "不可以"),
+        ("能不能", "能", "不能"),
+        ("要不要", "要", "不要"),
+        ("有沒有", "有", "沒有"),
+        ("是不是", "是", "不是"),
+        ("會不會", "會", "不會"),
+        ("該不該", "該", "不該"),
+        ("敢不敢", "敢", "不敢"),
+        ("好不好", "好", "不好"),
+        ("行不行", "行", "不行"),
+        ("對不對", "對", "不對"),
+        ("夠不夠", "夠", "不夠"),
+        ("算不算", "算", "不算"),
+        ("穩不穩", "穩", "不穩"),
+        ("雷不雷", "雷", "不雷"),
+        ("香不香", "香", "不香"),
+        ("盤不盤", "盤", "不盤"),
+        ("扯不扯", "扯", "不扯"),
+        ("爽不爽", "爽", "不爽"),
+        ("累不累", "累", "不累"),
+        ("貴不貴", "貴", "不貴"),
+        ("便不便宜", "便宜", "不便宜"),
+        ("尷不尷尬", "尷尬", "不尷尬"),
+        ("尬不尬", "尬", "不尬"),
+        ("急不急", "急", "不急"),
+        ("難不難", "難", "不難"),
+        ("簡不簡單", "簡單", "不簡單"),
+        ("麻不麻煩", "麻煩", "不麻煩"),
+        ("危不危險", "危險", "不危險"),
+        ("安不安全", "安全", "不安全"),
+        ("確不確定", "確定", "不確定"),
+        ("真不真", "真", "不真"),
+        ("假不假", "假", "不假"),
+        ("準不準", "準", "不準"),
+        ("準備好了沒", "準備好了", "還沒"),
+        ("好了沒", "好了", "還沒"),
+        ("可否", "可以", "不可以"),
+        ("能否", "能", "不能"),
+        ("是否", "是", "不是"),
+        ("有無", "有", "沒有"),
+    ]
+    for pattern, yes_value, no_value in fixed_patterns:
+        if pattern in body:
+            return yes_value, no_value
+
+    modal_question_patterns = [
+        (r"值得.*嗎$", "值得", "不值得"),
+        (r"喜歡.*嗎$", "喜歡", "不喜歡"),
+        (r"知道.*嗎$", "知道", "不知道"),
+        (r"認識.*嗎$", "認識", "不認識"),
+        (r"記得.*嗎$", "記得", "不記得"),
+        (r"建議.*嗎$", "建議", "不建議"),
+        (r"推薦.*嗎$", "推薦", "不推薦"),
+        (r"適合.*嗎$", "適合", "不適合"),
+        (r"合適.*嗎$", "合適", "不合適"),
+        (r"靠譜.*嗎$", "靠譜", "不靠譜"),
+        (r"可行.*嗎$", "可行", "不可行"),
+        (r"會.*嗎$", "會", "不會"),
+        (r"可以.*嗎$", "可以", "不可以"),
+        (r"能.*嗎$", "能", "不能"),
+        (r"要.*嗎$", "要", "不要"),
+        (r"有.*嗎$", "有", "沒有"),
+        (r"是.*嗎$", "是", "不是"),
+        (r"該.*嗎$", "該", "不該"),
+        (r"敢.*嗎$", "敢", "不敢"),
+        (r"好.*嗎$", "好", "不好"),
+        (r"行.*嗎$", "行", "不行"),
+        (r"對.*嗎$", "對", "不對"),
+        (r"夠.*嗎$", "夠", "不夠"),
+        (r"算.*嗎$", "算", "不算"),
+    ]
+    for pattern, yes_value, no_value in modal_question_patterns:
+        if re.search(pattern, compact_body):
+            return yes_value, no_value
 
     match = RANDOM_X_NOT_X_REGEX.search(body)
     if match is None:
