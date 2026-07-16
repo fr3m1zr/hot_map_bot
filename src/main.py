@@ -1,11 +1,15 @@
 from datetime import datetime, timedelta, timezone
 import asyncio
+from html.parser import HTMLParser
 import json
 import random
 from io import BytesIO
 import re
 import traceback
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Any, Dict, List, Set, Tuple
 
 import discord # pyright: ignore[reportMissingImports]
@@ -22,6 +26,10 @@ OTHER_CATEGORY_LABEL = "其他"
 MAX_CHART_CHANNELS = 12
 CUSTOM_EMOJI_REGEX = re.compile(r"<a?:([A-Za-z0-9_]+):(\d+)>")
 URL_REGEX = re.compile(r"https?://\S+", re.IGNORECASE)
+INSTAGRAM_URL_REGEX = re.compile(
+    r"https?://(?:www\.)?(?:instagram|instagram7)\.com/[^\s<>()]+",
+    re.IGNORECASE,
+)
 UNICODE_EMOJI_REGEX = re.compile(
     r"[\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2600-\u27BF\u200d\ufe0f]"
 )
@@ -50,6 +58,12 @@ OTHER_REASON_UNRECOGNIZED = "未識別格式"
 TABETAI_RECENT_MEAL_COUNT = 4
 TABETAI_ANIMATION_STEPS = 8
 TABETAI_ANIMATION_DELAY_SEC = 0.20
+INSTAGRAM7_BASE_URL = "https://www.instagram7.com"
+INSTAGRAM_PREVIEW_MAX_IMAGES = 4
+INSTAGRAM_PREVIEW_TIMEOUT_SEC = 6
+INSTAGRAM_PREVIEW_USER_AGENT = (
+    "Discordbot/2.0; +https://discordapp.com"
+)
 RANDOM_X_NOT_X_RESULT_REGEX = re.compile(
     r"(?P<x>[^\s不嗎?？]{1,20})\s*不\s*(?P=x)\s*[得的]\s*(?P<result>到|懂|及|動|起|完|下|住|成)"
 )
@@ -227,6 +241,240 @@ def truncate_text(text: str, limit: int = 1000) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3].rstrip() + "..."
+
+
+class MetaTagParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.meta: Dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, str | None]]) -> None:
+        if tag.lower() != "meta":
+            return
+        attr_map = {name.lower(): value or "" for name, value in attrs}
+        content = attr_map.get("content", "").strip()
+        if not content:
+            return
+        key = attr_map.get("property") or attr_map.get("name")
+        if key:
+            self.meta[key.lower()] = content
+
+
+def get_meta_content(html: str, *keys: str) -> str:
+    parser = MetaTagParser()
+    parser.feed(html)
+    for key in keys:
+        value = parser.meta.get(key.lower(), "").strip()
+        if value:
+            return value
+    return ""
+
+
+def sanitize_url_candidate(raw_url: str) -> str:
+    return raw_url.strip().rstrip(".,;:!?)>]}'\"。！？）」』】")
+
+
+def parse_instagram_preview_target(raw_url: str) -> Dict[str, Any] | None:
+    url = sanitize_url_candidate(raw_url)
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return None
+
+    host = parsed.hostname.lower() if parsed.hostname else ""
+    if host not in {"instagram.com", "www.instagram.com", "instagram7.com", "www.instagram7.com"}:
+        return None
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if len(path_parts) < 2:
+        return None
+
+    media_type = path_parts[0].lower()
+    if media_type not in {"p", "reel", "reels", "tv"}:
+        return None
+
+    shortcode = path_parts[1]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", shortcode):
+        return None
+
+    img_index: int | None = None
+    query = urllib.parse.parse_qs(parsed.query)
+    raw_img_index = query.get("img_index", [""])[0].strip()
+    if raw_img_index:
+        try:
+            parsed_img_index = int(raw_img_index)
+        except ValueError:
+            return None
+        if parsed_img_index < 1:
+            return None
+        img_index = parsed_img_index
+
+    canonical_media_type = "reel" if media_type == "reels" else media_type
+    return {
+        "media_type": canonical_media_type,
+        "shortcode": shortcode,
+        "img_index": img_index,
+        "original_url": f"https://www.instagram.com/{canonical_media_type}/{shortcode}/",
+    }
+
+
+def find_instagram_preview_target(content: str) -> Dict[str, Any] | None:
+    for match in INSTAGRAM_URL_REGEX.finditer(content):
+        target = parse_instagram_preview_target(match.group(0))
+        if target is not None:
+            return target
+    return None
+
+
+def build_instagram7_embed_url(target: Dict[str, Any], img_index: int | None = None) -> str:
+    base_url = (
+        f"{INSTAGRAM7_BASE_URL}/{target['media_type']}/"
+        f"{target['shortcode']}/"
+    )
+    if img_index is None:
+        return base_url
+    return f"{base_url}?img_index={img_index}"
+
+
+def build_instagram7_media_url(target: Dict[str, Any], img_index: int) -> str:
+    return f"{INSTAGRAM7_BASE_URL}/offload/{target['shortcode']}/{img_index}"
+
+
+def fetch_instagram7_html(url: str) -> str:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": INSTAGRAM_PREVIEW_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=INSTAGRAM_PREVIEW_TIMEOUT_SEC) as response:
+        content_type = response.headers.get_content_charset() or "utf-8"
+        return response.read(512 * 1024).decode(content_type, errors="replace")
+
+
+def is_instagram7_media_out_of_range(html: str) -> bool:
+    description = get_meta_content(
+        html,
+        "og:description",
+        "twitter:description",
+        "description",
+    )
+    return "Media number out of range" in html or "Media number out of range" in description
+
+
+def parse_instagram_media_count(description: str) -> int | None:
+    match = re.search(r"(?:🖼️?|📷)\s*(\d{1,2})", description)
+    if match is None:
+        return None
+    count = int(match.group(1))
+    if count <= 0:
+        return None
+    return count
+
+
+def clean_instagram_preview_description(description: str) -> str:
+    lines = [line.strip() for line in description.splitlines()]
+    while lines and not lines[0]:
+        lines.pop(0)
+    if lines and re.fullmatch(
+        r"(?:(?:🖼️?|📷)\s*\d+\s*)?(?:❤️\s*[\d,]+\s*)?(?:💬\s*[\d,]+\s*)?",
+        lines[0],
+    ):
+        lines.pop(0)
+    return "\n".join(line for line in lines).strip()
+
+
+def build_instagram_preview_payload(target: Dict[str, Any]) -> Dict[str, Any] | None:
+    requested_img_index = target.get("img_index")
+    metadata_url = build_instagram7_embed_url(target, requested_img_index)
+    try:
+        metadata_html = fetch_instagram7_html(metadata_url)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        print(f"[InstagramPreview] Failed to fetch metadata url={metadata_url}: {exc}")
+        return None
+
+    if is_instagram7_media_out_of_range(metadata_html):
+        return None
+
+    author = get_meta_content(metadata_html, "og:title", "twitter:title").strip()
+    raw_description = get_meta_content(
+        metadata_html,
+        "og:description",
+        "twitter:description",
+        "description",
+    ).strip()
+    description = clean_instagram_preview_description(raw_description)
+    media_count = parse_instagram_media_count(raw_description)
+    video_url = get_meta_content(
+        metadata_html,
+        "og:video",
+        "og:video:url",
+        "og:video:secure_url",
+        "twitter:player",
+    ).strip()
+    is_video_preview = target.get("media_type") in {"reel", "tv"} or bool(video_url)
+
+    if requested_img_index is not None:
+        image_indices = [requested_img_index]
+    elif media_count is not None:
+        image_indices = list(range(1, min(media_count, INSTAGRAM_PREVIEW_MAX_IMAGES) + 1))
+    else:
+        image_indices = [1]
+        for img_index in range(2, INSTAGRAM_PREVIEW_MAX_IMAGES + 1):
+            probe_url = build_instagram7_embed_url(target, img_index)
+            try:
+                probe_html = fetch_instagram7_html(probe_url)
+            except (urllib.error.URLError, TimeoutError, OSError):
+                break
+            if is_instagram7_media_out_of_range(probe_html):
+                break
+            image_indices.append(img_index)
+
+    if not image_indices:
+        return None
+
+    return {
+        "author": author or "Instagram",
+        "description": description,
+        "media_count": media_count,
+        "image_indices": image_indices,
+        "is_video_preview": is_video_preview,
+        "instagram7_url": metadata_url,
+        "original_url": target["original_url"],
+        "target": target,
+    }
+
+
+async def fetch_instagram_preview_payload(target: Dict[str, Any]) -> Dict[str, Any] | None:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, build_instagram_preview_payload, target)
+
+
+def build_instagram_preview_embeds(payload: Dict[str, Any]) -> List[discord.Embed]:
+    embeds: List[discord.Embed] = []
+    image_indices = payload["image_indices"]
+    target = payload["target"]
+    author = to_text(payload.get("author")).strip() or "Instagram"
+    description = to_text(payload.get("description")).strip()
+    original_url = to_text(payload.get("original_url"))
+
+    for position, img_index in enumerate(image_indices, start=1):
+        embed = discord.Embed(
+            title="查看 Instagram 貼文",
+            url=original_url,
+            color=0xE1306C,
+        )
+        embed.set_author(
+            name=author,
+            url=original_url,
+        )
+        if position == 1 and description:
+            embed.description = truncate_text(description, 3800)
+        embed.set_image(url=build_instagram7_media_url(target, img_index))
+        embeds.append(embed)
+
+    return embeds
 
 
 def json_item_count(raw: str) -> int:
@@ -1239,6 +1487,41 @@ class HotmapBot(discord.Client):
 
         if random_replied and not random_bypass:
             self._mark_random_cooldown(message.author.id, datetime.now(timezone.utc))
+
+        instagram_preview_target = find_instagram_preview_target(message_text)
+        if instagram_preview_target is not None:
+            try:
+                instagram_preview_payload = await fetch_instagram_preview_payload(
+                    instagram_preview_target
+                )
+                if instagram_preview_payload is not None:
+                    if instagram_preview_payload.get("is_video_preview"):
+                        await message.reply(
+                            to_text(instagram_preview_payload.get("instagram7_url")),
+                            mention_author=False,
+                        )
+                    else:
+                        instagram_preview_embeds = build_instagram_preview_embeds(
+                            instagram_preview_payload
+                        )
+                        if instagram_preview_embeds:
+                            await message.reply(
+                                embeds=instagram_preview_embeds,
+                                mention_author=False,
+                            )
+            except discord.HTTPException as exc:
+                print(
+                    "[InstagramPreview] Failed to reply "
+                    f"channel={getattr(message.channel, 'id', 'unknown')} "
+                    f"message_id={message.id}: {exc}"
+                )
+            except Exception as exc:
+                print(
+                    "[InstagramPreview] Unexpected failure "
+                    f"channel={getattr(message.channel, 'id', 'unknown')} "
+                    f"message_id={message.id}: {exc}"
+                )
+                traceback.print_exc()
 
         if not message.guild:
             return
